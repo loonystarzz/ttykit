@@ -110,7 +110,7 @@ install_deps() {
     fi
 
     touch "$DEPS_FILE"
-    ok "Setup complete"
+    ok "Setup complete; may need to install wifi drivers and networkmanager wifi plugin if not already installed."
 }
 
 
