@@ -43,7 +43,6 @@ install_deps() {
     local pkgs=()
 
     check_cmd brightnessctl    || pkgs+=(brightnessctl)
-    check_cmd bluetuith        || pkgs+=(bluetuith)
     check_cmd wpctl            || pkgs+=(wireplumber pipewire-utils)
     check_cmd nmcli            || pkgs+=(NetworkManager)
     check_cmd fzf              || pkgs+=(fzf)
@@ -65,6 +64,19 @@ install_deps() {
         fi
     else
         ok "All dependencies already installed"
+    fi
+
+    # bluetuith — not in official Fedora repos, needs COPR
+    if ! check_cmd bluetuith; then
+        echo "Installing bluetuith via COPR (nickel-org/bluetuith)..."
+        if [[ $EUID -ne 0 ]]; then
+            sudo dnf copr enable -y nickel-org/bluetuith
+            sudo dnf install -y bluetuith
+        else
+            dnf copr enable -y nickel-org/bluetuith
+            dnf install -y bluetuith
+        fi
+        check_cmd bluetuith && ok "bluetuith installed" || warn "bluetuith install failed — bluetooth TUI unavailable"
     fi
 
     # allow brightnessctl without sudo for current user
