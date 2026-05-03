@@ -66,17 +66,36 @@ install_deps() {
         ok "All dependencies already installed"
     fi
 
-    # bluetuith — not in official Fedora repos, needs COPR
+    # bluetuith — not in official Fedora repos, install binary from GitHub releases
     if ! check_cmd bluetuith; then
-        echo "Installing bluetuith via COPR (nickel-org/bluetuith)..."
-        if [[ $EUID -ne 0 ]]; then
-            sudo dnf copr enable -y nickel-org/bluetuith
-            sudo dnf install -y bluetuith
-        else
-            dnf copr enable -y nickel-org/bluetuith
-            dnf install -y bluetuith
+        echo "Installing bluetuith from GitHub releases..."
+        local arch
+        arch=$(uname -m)
+        # map uname arch to release archive naming
+        case "$arch" in
+            x86_64)  arch="x86_64"  ;;
+            aarch64) arch="arm64"   ;;
+            armv7l)  arch="armv7"   ;;
+            *)       warn "Unknown arch $arch — skipping bluetuith install"; arch="" ;;
+        esac
+        if [[ -n "$arch" ]]; then
+            local tag url tmp
+            # get latest release tag from GitHub API
+            tag=$(curl -fsSL https://api.github.com/repos/darkhz/bluetuith/releases/latest \
+                2>/dev/null | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\(.*\)".*/\1/')
+            # strip leading v for filename
+            local ver="${tag#v}"
+            url="https://github.com/darkhz/bluetuith/releases/download/${tag}/bluetuith_${ver}_Linux_${arch}.tar.gz"
+            tmp=$(mktemp -d)
+            if curl -fsSL "$url" | tar -xz -C "$tmp" 2>/dev/null; then
+                install -m 755 "$tmp/bluetuith" /usr/local/bin/bluetuith
+                rm -rf "$tmp"
+                ok "bluetuith ${tag} installed to /usr/local/bin/bluetuith"
+            else
+                rm -rf "$tmp"
+                warn "bluetuith download failed (url: $url) — bluetooth TUI unavailable"
+            fi
         fi
-        check_cmd bluetuith && ok "bluetuith installed" || warn "bluetuith install failed — bluetooth TUI unavailable"
     fi
 
     # allow brightnessctl without sudo for current user
@@ -158,7 +177,7 @@ menu_audio() {
             "6" "Show sinks (wpctl)" \
             "b" "← Back" \
             3>&1 1>&2 2>&3) || return
-        last="$choice"
+        [[ -n "$choice" ]] && last="$choice"
 
         case "$choice" in
             1) audio_vol_up;   ok "Volume: $(get_volume)%" ;;
@@ -201,7 +220,7 @@ menu_brightness() {
             "5" "Dim (10%)" \
             "b" "← Back" \
             3>&1 1>&2 2>&3) || return
-        last="$choice"
+        [[ -n "$choice" ]] && last="$choice"
 
         case "$choice" in
             1) brightness_up;   ok "Brightness: $(get_brightness)%" ;;
@@ -302,6 +321,100 @@ wifi_connect() {
     sleep 1
 }
 
+# ─── adapter overview ─────────────────────────────────────────────────────────
+network_adapters() {
+    while true; do
+        clear
+        hdr "Network Adapters"
+
+        # build adapter list with state, type, IP, MAC
+        local lines=()
+        while IFS= read -r iface; do
+            [[ "$iface" == "lo" ]] && continue
+            local state ip mac type_icon
+            state=$(cat "/sys/class/net/${iface}/operstate" 2>/dev/null || echo "?")
+            mac=$(cat "/sys/class/net/${iface}/address"    2>/dev/null || echo "?")
+            ip=$(ip -4 -brief addr show "$iface" 2>/dev/null | awk '{print $3}')
+            # guess type from name / sys
+            if [[ -d "/sys/class/net/${iface}/wireless" ]]; then
+                type_icon="wifi"
+            elif [[ "$iface" == eth* || "$iface" == en* ]]; then
+                type_icon="eth "
+            elif [[ "$iface" == wg*  || "$iface" == tun* || "$iface" == tap* ]]; then
+                type_icon="vpn "
+            else
+                type_icon="    "
+            fi
+            local state_str
+            [[ "$state" == "up" ]] && state_str="UP  " || state_str="DOWN"
+            lines+=("${iface}|${type_icon}|${state_str}|${ip:-no ip}|${mac}")
+        done < <(ls /sys/class/net/)
+
+        if [[ ${#lines[@]} -eq 0 ]]; then
+            echo "  No adapters found"
+            read -rp "Press enter..."; return
+        fi
+
+        # print table
+        printf "  %-12s  %-4s  %-4s  %-18s  %s\n" "INTERFACE" "TYPE" "STATE" "IP" "MAC"
+        printf "  %s\n" "$(printf '─%.0s' {1..60})"
+        local fzf_input=""
+        for line in "${lines[@]}"; do
+            IFS='|' read -r iface type_icon state_str ip mac <<< "$line"
+            printf "  %-12s  %-4s  %-4s  %-18s  %s\n" \
+                "$iface" "$type_icon" "$state_str" "$ip" "$mac"
+            fzf_input+="$iface  [$state_str]  $ip  $mac"$'\n'
+        done
+        echo
+
+        # fzf picker for actions
+        local selected
+        selected=$(echo "$fzf_input" \
+            | fzf --prompt="Adapter > " \
+                  --header="Enter=manage  Esc=back" \
+                  --height=40% --border=rounded) || return
+
+        local sel_iface
+        sel_iface=$(echo "$selected" | awk '{print $1}')
+        [[ -z "$sel_iface" ]] && return
+
+        local sel_state
+        sel_state=$(cat "/sys/class/net/${sel_iface}/operstate" 2>/dev/null || echo "?")
+
+        local action
+        action=$(whiptail --title "Adapter: $sel_iface  [$sel_state]" \
+            --menu "Choose action" 14 50 5 \
+            "1" "Enable  (ip link set up)" \
+            "2" "Disable (ip link set down)" \
+            "3" "Restart via NetworkManager" \
+            "4" "Show full details" \
+            "b" "← Back" \
+            3>&1 1>&2 2>&3) || continue
+
+        case "$action" in
+            1)
+                ip link set "$sel_iface" up   && ok "$sel_iface enabled"  || err "Failed"
+                sleep 1 ;;
+            2)
+                ip link set "$sel_iface" down && ok "$sel_iface disabled" || err "Failed"
+                sleep 1 ;;
+            3)
+                nmcli device disconnect "$sel_iface" 2>/dev/null || true
+                nmcli device connect    "$sel_iface" 2>/dev/null \
+                    && ok "$sel_iface reconnected" || err "Failed — check nmcli"
+                sleep 1 ;;
+            4)
+                clear; hdr "Details: $sel_iface"
+                ip -s link show "$sel_iface"
+                echo
+                ip -4 addr show "$sel_iface"
+                ip -6 addr show "$sel_iface"
+                echo; read -rp "Press enter..." ;;
+            b) ;;
+        esac
+    done
+}
+
 # ─── networking menu ──────────────────────────────────────────────────────────
 menu_network() {
     while true; do
@@ -319,12 +432,13 @@ menu_network() {
 
         local choice
         choice=$(whiptail --title "Networking  [${status_line}]" \
-            --menu "Choose action" 16 55 6 \
+            --menu "Choose action" 18 55 7 \
             "1" "Connect to WiFi (fzf picker)" \
             "2" "Disconnect current" \
             "3" "Saved connections" \
-            "4" "Show IP addresses" \
-            "5" "Restart NetworkManager" \
+            "4" "Adapters (enable/disable/details)" \
+            "5" "Show IP addresses" \
+            "6" "Restart NetworkManager" \
             "b" "← Back" \
             3>&1 1>&2 2>&3) || return
 
@@ -340,7 +454,6 @@ menu_network() {
                 ;;
             3)
                 clear; hdr "Saved Connections"
-                # fzf picker for saved connections — enter to reconnect, del to forget
                 local saved
                 saved=$(nmcli -t -f NAME,TYPE,TIMESTAMP-REAL connection show 2>/dev/null \
                     | awk -F: '{printf "%-30s  %-12s  %s\n", $1, $2, $3}' \
@@ -354,12 +467,13 @@ menu_network() {
                     && ok "Connected: $cname" || true
                 sleep 1
                 ;;
-            4)
+            4) network_adapters ;;
+            5)
                 clear; hdr "IP Addresses"
                 ip -brief addr
                 echo; read -rp "Press enter..."
                 ;;
-            5)
+            6)
                 systemctl restart NetworkManager
                 ok "NetworkManager restarted"
                 sleep 2
