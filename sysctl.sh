@@ -180,10 +180,10 @@ menu_audio() {
         [[ -n "$choice" ]] && last="$choice"
 
         case "$choice" in
-            1) audio_vol_up;   ok "Volume: $(get_volume)%" ;;
-            2) audio_vol_down; ok "Volume: $(get_volume)%" ;;
-            3) audio_mute;     ok "Mute: $(get_mute)" ;;
-            4) audio_mic_mute; ok "Mic mute toggled" ;;
+            1) audio_vol_up   ;;
+            2) audio_vol_down ;;
+            3) audio_mute     ;;
+            4) audio_mic_mute ;;
             5)
                 local val
                 val=$(whiptail --inputbox "Enter volume (0-100):" 8 40 "$vol" \
@@ -393,10 +393,10 @@ network_adapters() {
 
         case "$action" in
             1)
-                ip link set "$sel_iface" up   && ok "$sel_iface enabled"  || err "Failed"
+                sudo ip link set "$sel_iface" up   && ok "$sel_iface enabled"  || err "Failed"
                 sleep 1 ;;
             2)
-                ip link set "$sel_iface" down && ok "$sel_iface disabled" || err "Failed"
+                sudo ip link set "$sel_iface" down && ok "$sel_iface disabled" || err "Failed"
                 sleep 1 ;;
             3)
                 nmcli device disconnect "$sel_iface" 2>/dev/null || true
