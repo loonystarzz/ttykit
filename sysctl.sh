@@ -46,6 +46,7 @@ install_deps() {
     check_cmd wpctl            || pkgs+=(wireplumber pipewire-utils)
     check_cmd nmcli            || pkgs+=(NetworkManager)
     check_cmd fzf              || pkgs+=(fzf)
+    check_cmd aplay            || pkgs+=(alsa-utils)
     check_cmd python3          || pkgs+=(python3)
     # python3-evdev for key daemon
     python3 -c "import evdev" 2>/dev/null || pkgs+=(python3-evdev)
