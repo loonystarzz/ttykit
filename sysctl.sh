@@ -160,13 +160,14 @@ show_status() {
 # ─── audio menu ───────────────────────────────────────────────────────────────
 menu_audio() {
     local last="1"
+    local tmp
+    tmp=$(mktemp)
     while true; do
         local vol mute
         vol=$(get_volume 2>/dev/null || echo "?")
         mute=$(get_mute 2>/dev/null || echo "?")
 
-        local choice
-        choice=$(whiptail --title "Audio  [vol: ${vol}% | ${mute}]" \
+        whiptail --title "Audio  [vol: ${vol}% | ${mute}]" \
             --default-item "$last" \
             --menu "Choose action" 18 50 8 \
             "1" "Volume up   (+${VOLUME_STEP}%)" \
@@ -176,7 +177,9 @@ menu_audio() {
             "5" "Set volume (custom %)" \
             "6" "Show sinks (wpctl)" \
             "b" "← Back" \
-            3>&1 1>&2 2>&3) || return
+            2>"$tmp" || { rm -f "$tmp"; return; }
+        local choice
+        choice=$(cat "$tmp")
         [[ -n "$choice" ]] && last="$choice"
 
         case "$choice" in
@@ -185,11 +188,11 @@ menu_audio() {
             3) audio_mute     ;;
             4) audio_mic_mute ;;
             5)
+                whiptail --inputbox "Enter volume (0-100):" 8 40 "$vol" \
+                    --title "Set Volume" 2>"$tmp" || continue
                 local val
-                val=$(whiptail --inputbox "Enter volume (0-100):" 8 40 "$vol" \
-                    --title "Set Volume" 3>&1 1>&2 2>&3) || continue
+                val=$(cat "$tmp")
                 wpctl set-volume @DEFAULT_AUDIO_SINK@ "${val}%"
-                ok "Volume set to ${val}%"
                 ;;
             6)
                 clear
@@ -197,7 +200,7 @@ menu_audio() {
                 wpctl status | grep -A30 "Sinks"
                 echo; read -rp "Press enter to continue..."
                 ;;
-            b) return ;;
+            b) rm -f "$tmp"; return ;;
         esac
     done
 }
@@ -804,7 +807,7 @@ __sysctl_prompt() {
     local bat time_str
     bat=$(__sysctl_bat)
     time_str=$(date +%H:%M)
-    PS1="${bold}${cyan}\u@\h${reset} : ${yellow}${bat}${reset} : ${green}${time_str}${reset}\n\$ "
+    PS1="${bold}${cyan}\u@\h${reset} : ${yellow}${bat}${reset} : ${green}${time_str}${reset} : ${bold}\w${reset}\n\$ "
 }
 PROMPT_COMMAND='__sysctl_prompt'
 # sysctl-prompt-end
