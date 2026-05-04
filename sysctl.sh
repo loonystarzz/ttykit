@@ -48,6 +48,7 @@ install_deps() {
     check_cmd nmcli            || pkgs+=(NetworkManager)
     check_cmd fzf              || pkgs+=(fzf)
     check_cmd python3          || pkgs+=(python3)
+    check_cmd tmux             || pkgs+=(tmux)
     # python3-evdev for key daemon
     python3 -c "import evdev" 2>/dev/null || pkgs+=(python3-evdev)
     # whiptail for TUI
@@ -181,7 +182,9 @@ menu_audio() {
             2>"$tmp" || { rm -f "$tmp"; return; }
         local choice
         choice=$(cat "$tmp")
-        [[ -n "$choice" ]] && last="$choice"
+        # guard against empty or invalid choice (e.g. whiptail returning -1)
+        [[ -z "$choice" || "$choice" == "-1" ]] && continue
+        last="$choice"
 
         case "$choice" in
             1) audio_vol_up   ;;
@@ -193,7 +196,12 @@ menu_audio() {
                     --title "Set Volume" 2>"$tmp" || continue
                 local val
                 val=$(cat "$tmp")
-                wpctl set-volume @DEFAULT_AUDIO_SINK@ "${val}%"
+                # validate it's a plain integer before passing to wpctl
+                if [[ "$val" =~ ^[0-9]+$ ]] && [[ "$val" -le 150 ]]; then
+                    wpctl set-volume @DEFAULT_AUDIO_SINK@ "${val}%"
+                else
+                    warn "Invalid volume: $val"
+                fi
                 ;;
             6)
                 clear
@@ -976,12 +984,182 @@ PROMPT
     echo "  Re-open your terminal (or: source $bashrc) to activate"
 }
 
+# ─── yes/no prompt helper ─────────────────────────────────────────────────────
+_ask_yn() {
+    # usage: _ask_yn "Question text" [default: y|n]
+    local prompt="$1"
+    local default="${2:-y}"
+    local hint
+    [[ "$default" == "y" ]] && hint="[Y/n]" || hint="[y/N]"
+    while true; do
+        printf "${BOLD}${CYAN}?${RESET} %s %s " "$prompt" "$hint"
+        local reply
+        read -r reply
+        reply="${reply:-$default}"
+        case "${reply,,}" in
+            y|yes) return 0 ;;
+            n|no)  return 1 ;;
+            *) echo "  Please answer y or n." ;;
+        esac
+    done
+}
+
+# ─── motd ─────────────────────────────────────────────────────────────────────
+setup_motd() {
+    local target_user="${SUDO_USER:-$USER}"
+    local home
+    home=$(eval echo "~${target_user}")
+    local motd_script="${home}/.ttykit-motd"
+    local bashrc="${home}/.bashrc"
+
+    cat > "$motd_script" <<'MOTD_SCRIPT'
+#!/usr/bin/env bash
+# ttykit motd — shown on login
+
+_motd_bat() {
+    local p=$(cat /sys/class/power_supply/BAT*/capacity 2>/dev/null | head -1)
+    local s=$(cat /sys/class/power_supply/BAT*/status   2>/dev/null | head -1)
+    [[ -z "$p" ]] && echo "no bat" && return
+    local icon; case "$s" in Charging) icon="↑";; Discharging) icon="↓";; Full) icon="⚡";; *) icon="?";; esac
+    local bar="" filled=$(( p * 10 / 100 ))
+    for ((i=0;i<filled;i++));  do bar+="█"; done
+    for ((i=filled;i<10;i++)); do bar+="░"; done
+    echo "[${bar}] ${p}%${icon} ${s}"
+}
+
+_motd_net() {
+    local conn ip
+    conn=$(nmcli -t -f NAME,STATE connection show --active 2>/dev/null \
+        | grep ":activated" | head -1 | cut -d: -f1)
+    ip=$(ip -4 -brief addr show up 2>/dev/null \
+        | awk '$1!="lo"{print $3;exit}' | cut -d/ -f1)
+    if [[ -n "$conn" ]]; then
+        echo "${conn}  ${ip:-no ip}"
+    else
+        local wifi_state
+        wifi_state=$(nmcli radio wifi 2>/dev/null | head -1)
+        echo "offline (wifi: ${wifi_state:-?})"
+    fi
+}
+
+_motd_ws() {
+    local session="workspaces"
+    if tmux has-session -t "$session" 2>/dev/null; then
+        local wins
+        wins=$(tmux list-windows -t "$session" -F "#{window_index}" 2>/dev/null | tr '\n' ' ')
+        echo "active  [${wins% }]"
+    else
+        echo "not started"
+    fi
+}
+
+R='\033[0m'; BD='\033[1m'; DIM='\033[2m'
+C1='\033[38;5;39m'   # sky blue
+C2='\033[38;5;87m'   # cyan
+C3='\033[38;5;245m'  # grey
+CG='\033[38;5;83m'   # green
+CY='\033[38;5;228m'  # yellow
+
+# ── banner ────────────────────────────────────────────────────────────────────
+echo -e "${C1}${BD}"
+echo '  ████████╗████████╗██╗   ██╗██╗  ██╗██╗████████╗'
+echo '     ██╔══╝╚══██╔══╝╚██╗ ██╔╝██║ ██╔╝██║╚══██╔══╝'
+echo '     ██║      ██║    ╚████╔╝ █████╔╝ ██║   ██║   '
+echo '     ██║      ██║     ╚██╔╝  ██╔═██╗ ██║   ██║   '
+echo '     ██║      ██║      ██║   ██║  ██╗██║   ██║   '
+echo '     ╚═╝      ╚═╝      ╚═╝   ╚═╝  ╚═╝╚═╝   ╚═╝   '
+echo -e "${R}"
+
+# ── stats ─────────────────────────────────────────────────────────────────────
+local_ip=$(_motd_net)
+bat_info=$(_motd_bat)
+ws_info=$(_motd_ws)
+uptime_str=$(uptime -p 2>/dev/null | sed 's/up //')
+load_str=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)
+kernel=$(uname -r)
+now=$(date '+%a %d %b  %H:%M')
+
+echo -e "  ${C3}┌──────────────────────────────────────────┐${R}"
+printf  "  ${C3}│${R}  ${BD}%-14s${R}  ${CG}%-26s${C3}│${R}\n" "host"     "$(hostname)"
+printf  "  ${C3}│${R}  ${BD}%-14s${R}  ${CY}%-26s${C3}│${R}\n" "time"     "$now"
+printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}│${R}\n"      "uptime"   "$uptime_str"
+printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}│${R}\n"      "load"     "$load_str"
+printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}│${R}\n"      "kernel"   "$kernel"
+echo -e "  ${C3}├──────────────────────────────────────────┤${R}"
+printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}│${R}\n"      "network"  "$local_ip"
+printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}│${R}\n"      "battery"  "$bat_info"
+printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}│${R}\n"      "workspaces" "$ws_info"
+echo -e "  ${C3}└──────────────────────────────────────────┘${R}"
+echo -e "  ${DIM}Ctrl+W → 1-9/0/a-f   switch workspace${R}"
+echo -e "  ${DIM}./sysctl.sh           system controls${R}"
+echo
+MOTD_SCRIPT
+
+    chmod +x "$motd_script"
+    chown "${target_user}:${target_user}" "$motd_script" 2>/dev/null || true
+
+    local marker="# ttykit-motd"
+    if ! grep -q "$marker" "$bashrc" 2>/dev/null; then
+        cat >> "$bashrc" <<BASHRC
+
+${marker}
+[[ -f "${motd_script}" ]] && bash "${motd_script}"
+# ttykit-motd-end
+BASHRC
+        ok "MOTD installed → ${motd_script}"
+        echo "  Will show on every new login shell"
+    else
+        warn "MOTD already configured in $bashrc — skipping"
+    fi
+}
+
 # ─── first-run ────────────────────────────────────────────────────────────────
 first_run() {
     [[ $EUID -ne 0 ]] && { err "Run --firstrun with sudo"; exit 1; }
-    install_deps
-    setup_prompt
-    ok "First-run complete. Open a new shell to see your new prompt."
+
+    echo
+    echo -e "${BOLD}${CYAN}╔══════════════════════════════════╗"
+    echo -e "║       ttykit  first-run          ║"
+    echo -e "╚══════════════════════════════════╝${RESET}"
+    echo
+
+    # ── step 1: packages ────────────────────────────────────────────────────
+    echo -e "${BOLD}Step 1/3 — System packages${RESET}"
+    echo "  Will install: brightnessctl alsa-utils wireplumber pipewire-utils"
+    echo "                NetworkManager fzf python3 tmux python3-evdev newt"
+    echo "                pipewire-pulse  + bluetuith from GitHub"
+    echo
+    if _ask_yn "Install packages and system deps?"; then
+        install_deps
+    else
+        warn "Skipping package install — some features may not work"
+    fi
+    echo
+
+    # ── step 2: prompt ──────────────────────────────────────────────────────
+    echo -e "${BOLD}Step 2/3 — Custom bash prompt${RESET}"
+    echo "  Adds a prompt showing:  user@host : battery% : HH:MM : cwd"
+    echo
+    if _ask_yn "Set up custom bash prompt?"; then
+        setup_prompt
+    else
+        warn "Skipping prompt setup"
+    fi
+    echo
+
+    # ── step 3: motd ────────────────────────────────────────────────────────
+    echo -e "${BOLD}Step 3/3 — Login MOTD${RESET}"
+    echo "  Adds a status banner (host, time, battery, network, workspaces)"
+    echo "  shown every time you open a new terminal."
+    echo
+    if _ask_yn "Install MOTD?"; then
+        setup_motd
+    else
+        warn "Skipping MOTD setup"
+    fi
+    echo
+
+    ok "First-run complete. Open a new shell to see your changes."
 }
 
 # ─── quick info commands ───────────────────────────────────────────────────────

@@ -117,9 +117,21 @@ ws_switch() {
     local num="$1"
     [[ -z "$num" || $num -lt 1 || $num -gt $MAX_WORKSPACES ]] && return 1
 
-    if ! _session_exists; then
-        _ws_log "session not running, cannot switch"
-        return 1
+    # _session_exists uses tmux has-session which exits non-zero when no session;
+    # with set -euo pipefail active we must not let that propagate up.
+    if ! { tmux has-session -t "$TMUX_SESSION" 2>/dev/null; }; then
+        # if we're already inside tmux, the session must exist — this is a name mismatch
+        if [[ -n "${TMUX:-}" ]]; then
+            local current_session
+            current_session=$(tmux display-message -p "#S" 2>/dev/null || true)
+            if [[ "$current_session" != "$TMUX_SESSION" ]]; then
+                _ws_log "inside a different tmux session ($current_session), cannot switch $TMUX_SESSION"
+                return 1
+            fi
+        else
+            _ws_log "tmux session '$TMUX_SESSION' not running, cannot switch"
+            return 1
+        fi
     fi
 
     local existing
@@ -177,7 +189,10 @@ _ws_start() {
         fi
     fi
 
-    if _session_exists; then
+    local session_running=false
+    tmux has-session -t "$TMUX_SESSION" 2>/dev/null && session_running=true || true
+
+    if $session_running; then
         # session exists, reattach
         _ws_log "reattaching to existing session"
         exec tmux attach-session -t "$TMUX_SESSION"
