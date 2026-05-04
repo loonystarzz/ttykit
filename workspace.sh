@@ -195,7 +195,12 @@ _ws_start() {
     if $session_running; then
         # session exists, reattach
         _ws_log "reattaching to existing session"
-        exec tmux attach-session -t "$TMUX_SESSION"
+        # use exec only when run directly (not sourced), so we don't kill the sourcing shell
+        if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+            exec tmux attach-session -t "$TMUX_SESSION"
+        else
+            tmux attach-session -t "$TMUX_SESSION"
+        fi
     else
         # fresh start — create session with window 1
         _ws_log "creating new session"
@@ -203,7 +208,11 @@ _ws_start() {
         _ws_configure_tmux
         # pre-create the spare
         _ws_ensure_spare
-        exec tmux attach-session -t "$TMUX_SESSION"
+        if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+            exec tmux attach-session -t "$TMUX_SESSION"
+        else
+            tmux attach-session -t "$TMUX_SESSION"
+        fi
     fi
 }
 

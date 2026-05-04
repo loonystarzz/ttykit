@@ -162,14 +162,13 @@ show_status() {
 # ─── audio menu ───────────────────────────────────────────────────────────────
 menu_audio() {
     local last="1"
-    local tmp
-    tmp=$(mktemp)
     while true; do
         local vol mute
         vol=$(get_volume 2>/dev/null || echo "?")
         mute=$(get_mute 2>/dev/null || echo "?")
 
-        whiptail --title "Audio  [vol: ${vol}% | ${mute}]" \
+        local choice
+        choice=$(whiptail --title "Audio  [vol: ${vol}% | ${mute}]" \
             --default-item "$last" \
             --menu "Choose action" 18 50 8 \
             "1" "Volume up   (+${VOLUME_STEP}%)" \
@@ -179,10 +178,8 @@ menu_audio() {
             "5" "Set volume (custom %)" \
             "6" "Show sinks (wpctl)" \
             "b" "← Back" \
-            2>"$tmp" || { rm -f "$tmp"; return; }
-        local choice
-        choice=$(cat "$tmp")
-        # guard against empty or invalid choice (e.g. whiptail returning -1)
+            3>&1 1>&2 2>&3) || return
+        # guard against empty or invalid choice
         [[ -z "$choice" || "$choice" == "-1" ]] && continue
         last="$choice"
 
@@ -192,10 +189,9 @@ menu_audio() {
             3) audio_mute     ;;
             4) audio_mic_mute ;;
             5)
-                whiptail --inputbox "Enter volume (0-100):" 8 40 "$vol" \
-                    --title "Set Volume" 2>"$tmp" || continue
                 local val
-                val=$(cat "$tmp")
+                val=$(whiptail --inputbox "Enter volume (0-100):" 8 40 "$vol" \
+                    --title "Set Volume" 3>&1 1>&2 2>&3) || continue
                 # validate it's a plain integer before passing to wpctl
                 if [[ "$val" =~ ^[0-9]+$ ]] && [[ "$val" -le 150 ]]; then
                     wpctl set-volume @DEFAULT_AUDIO_SINK@ "${val}%"
@@ -209,7 +205,7 @@ menu_audio() {
                 wpctl status | grep -A30 "Sinks"
                 echo; read -rp "Press enter to continue..."
                 ;;
-            b) rm -f "$tmp"; return ;;
+            b) return ;;
         esac
     done
 }
@@ -537,44 +533,62 @@ menu_bluetooth() {
 
 # ─── key daemon menu ──────────────────────────────────────────────────────────
 menu_keydaemon() {
-    local running=false
-    [[ -f "$KEY_DAEMON_PIDFILE" ]] && kill -0 "$(cat "$KEY_DAEMON_PIDFILE")" 2>/dev/null && running=true
+    while true; do
+        local running=false
+        [[ -f "$KEY_DAEMON_PIDFILE" ]] && kill -0 "$(cat "$KEY_DAEMON_PIDFILE")" 2>/dev/null && running=true
 
-    local choice
-    choice=$(whiptail --title "Hardware Key Daemon" \
-        --menu "Status: $( $running && echo RUNNING || echo STOPPED)" 15 55 5 \
-        "1" "$( $running && echo 'Stop daemon' || echo 'Start daemon (requires root)')" \
-        "2" "View log" \
-        "3" "Install as systemd service" \
-        "4" "Remove systemd service" \
-        "b" "← Back" \
-        3>&1 1>&2 2>&3) || return
+        local choice
+        choice=$(whiptail --title "Hardware Key Daemon" \
+            --menu "Status: $( $running && echo RUNNING || echo STOPPED)" 15 55 5 \
+            "1" "$( $running && echo 'Stop daemon' || echo 'Start daemon (requires root)')" \
+            "2" "View log" \
+            "3" "Install as systemd service" \
+            "4" "Remove systemd service" \
+            "b" "← Back" \
+            3>&1 1>&2 2>&3) || return
 
-    case "$choice" in
-        1)
-            if $running; then
-                kill "$(cat "$KEY_DAEMON_PIDFILE")" && rm -f "$KEY_DAEMON_PIDFILE"
-                ok "Daemon stopped"
-            else
-                if [[ $EUID -ne 0 ]]; then
-                    warn "Starting daemon requires root. Running: sudo $0 --keys &"
-                    sudo "$0" --keys &
+        case "$choice" in
+            1)
+                if $running; then
+                    kill "$(cat "$KEY_DAEMON_PIDFILE")" 2>/dev/null || true
+                    # wait for process to actually die before removing pidfile
+                    local pid
+                    pid=$(cat "$KEY_DAEMON_PIDFILE" 2>/dev/null || true)
+                    for _ in 1 2 3 4 5; do
+                        kill -0 "$pid" 2>/dev/null || break
+                        sleep 0.3
+                    done
+                    rm -f "$KEY_DAEMON_PIDFILE"
+                    ok "Daemon stopped"
                 else
-                    "$0" --keys &
+                    if [[ $EUID -ne 0 ]]; then
+                        warn "Starting daemon requires root. Running: sudo $0 --keys &"
+                        sudo "$0" --keys &
+                    else
+                        "$0" --keys &
+                    fi
+                    # wait for daemon to write its pidfile (up to 3s)
+                    local waited=0
+                    while [[ $waited -lt 10 ]]; do
+                        sleep 0.3
+                        (( waited++ ))
+                        [[ -f "$KEY_DAEMON_PIDFILE" ]] && \
+                            kill -0 "$(cat "$KEY_DAEMON_PIDFILE")" 2>/dev/null && break
+                    done
+                    ok "Daemon started"
                 fi
-                sleep 1
-                ok "Daemon started"
-            fi
-            ;;
-        2)
-            clear; hdr "Key Daemon Log"
-            tail -40 "$KEY_DAEMON_LOG" 2>/dev/null || echo "(no log yet)"
-            echo; read -rp "Press enter..."
-            ;;
-        3) install_systemd_service ;;
-        4) remove_systemd_service  ;;
-        b) return ;;
-    esac
+                # loop back — menu re-checks $running at top
+                ;;
+            2)
+                clear; hdr "Key Daemon Log"
+                tail -40 "$KEY_DAEMON_LOG" 2>/dev/null || echo "(no log yet)"
+                echo; read -rp "Press enter..."
+                ;;
+            3) install_systemd_service ;;
+            4) remove_systemd_service  ;;
+            b) return ;;
+        esac
+    done
 }
 
 # ─── systemd service install ──────────────────────────────────────────────────
@@ -758,51 +772,59 @@ def _key_to_ws(code):
 def ws_switch(num):
     """Switch to tmux workspace number, creating it if needed."""
     try:
+        # find tmux socket — daemon runs as root but tmux session belongs to the user
+        user = get_session_user()
+        uid = None
+        if user:
+            try:
+                uid = int(subprocess.check_output(["id", "-u", user], text=True).strip())
+            except Exception:
+                pass
+
+        def tmux_cmd(*args):
+            """Run a tmux command, injecting TMUX_TMPDIR so root can reach the user's socket."""
+            env = os.environ.copy()
+            if uid:
+                # tmux default socket lives in /tmp/tmux-<uid>/default
+                env["TMUX_TMPDIR"] = f"/tmp/tmux-{uid}"
+            return subprocess.run(["tmux"] + list(args), capture_output=True, text=True, env=env)
+
+        def tmux_out(*args):
+            env = os.environ.copy()
+            if uid:
+                env["TMUX_TMPDIR"] = f"/tmp/tmux-{uid}"
+            return subprocess.check_output(["tmux"] + list(args), text=True, env=env)
+
         # check session exists
-        r = subprocess.run(
-            ["tmux", "has-session", "-t", TMUX_SESSION],
-            capture_output=True
-        )
+        r = tmux_cmd("has-session", "-t", TMUX_SESSION)
         if r.returncode != 0:
-            log(f"workspace session not running, cannot switch")
+            log(f"workspace session '{TMUX_SESSION}' not found (uid={uid}) — is workspace.sh running?")
             return
 
         # check if window exists
-        existing = subprocess.check_output(
-            ["tmux", "list-windows", "-t", TMUX_SESSION, "-F", "#{window_index}"],
-            text=True
-        ).split()
+        existing = tmux_out("list-windows", "-t", TMUX_SESSION, "-F", "#{window_index}").split()
 
         if str(num) not in existing:
             total = len(existing)
             if total >= MAX_WORKSPACES:
                 log(f"max workspaces reached, cannot create ws{num}")
                 return
-            subprocess.run(
-                ["tmux", "new-window", "-t", f"{TMUX_SESSION}:{num}", "-n", f"ws{num}"],
-                capture_output=True
-            )
+            tmux_cmd("new-window", "-t", f"{TMUX_SESSION}:{num}", "-n", f"ws{num}")
             log(f"created workspace {num}")
 
-        subprocess.run(
-            ["tmux", "select-window", "-t", f"{TMUX_SESSION}:{num}"],
-            capture_output=True
-        )
+        tmux_cmd("select-window", "-t", f"{TMUX_SESSION}:{num}")
         log(f"switched to workspace {num}")
 
         # ensure spare in background
-        threading.Thread(target=_ensure_spare, daemon=True).start()
+        threading.Thread(target=lambda: _ensure_spare(tmux_cmd, tmux_out), daemon=True).start()
 
     except Exception as ex:
         log(f"ws_switch error: {ex}")
 
-def _ensure_spare():
+def _ensure_spare(tmux_cmd, tmux_out):
     """Keep at least one idle workspace pre-created."""
     try:
-        existing = subprocess.check_output(
-            ["tmux", "list-windows", "-t", TMUX_SESSION, "-F", "#{window_index}"],
-            text=True
-        ).split()
+        existing = tmux_out("list-windows", "-t", TMUX_SESSION, "-F", "#{window_index}").split()
         total = len(existing)
         if total >= MAX_WORKSPACES:
             return
@@ -828,11 +850,7 @@ def _ensure_spare():
             used = set(int(x) for x in existing)
             for i in range(1, MAX_WORKSPACES + 1):
                 if i not in used:
-                    subprocess.run(
-                        ["tmux", "new-window", "-t", f"{TMUX_SESSION}:{i}",
-                         "-n", f"ws{i}"],
-                        capture_output=True
-                    )
+                    tmux_cmd("new-window", "-t", f"{TMUX_SESSION}:{i}", "-n", f"ws{i}")
                     log(f"pre-created spare workspace {i}")
                     break
     except Exception as ex:
