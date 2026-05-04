@@ -43,10 +43,10 @@ install_deps() {
     local pkgs=()
 
     check_cmd brightnessctl    || pkgs+=(brightnessctl)
+    check_cmd aplay            || pkgs+=(alsa-utils)
     check_cmd wpctl            || pkgs+=(wireplumber pipewire-utils)
     check_cmd nmcli            || pkgs+=(NetworkManager)
     check_cmd fzf              || pkgs+=(fzf)
-    check_cmd aplay            || pkgs+=(alsa-utils)
     check_cmd python3          || pkgs+=(python3)
     # python3-evdev for key daemon
     python3 -c "import evdev" 2>/dev/null || pkgs+=(python3-evdev)
@@ -633,11 +633,14 @@ run_key_daemon() {
 
     # write the python listener inline
     python3 - <<'PYEOF' "$VOLUME_STEP" "$BRIGHTNESS_STEP" "$KEY_DAEMON_LOG"
-import sys, subprocess, os, time, glob, signal
+import sys, subprocess, os, time, glob, signal, threading
 
 vol_step   = sys.argv[1]  # e.g. "5"
 bri_step   = sys.argv[2]
 log_file   = sys.argv[3]
+
+TMUX_SESSION = "workspaces"
+MAX_WORKSPACES = 16
 
 try:
     import evdev
@@ -710,7 +713,124 @@ def bri_down():
     subprocess.run(["brightnessctl", "set", f"{bri_step}%-", "-q"])
     log("brightness down")
 
-# key code → action
+# ── workspace switching ────────────────────────────────────────────────────────
+# chord state: did we just see Ctrl+W?
+_ctrl_w_armed = False
+_ctrl_w_timer = None
+_ctrl_w_lock  = threading.Lock()
+
+def _disarm():
+    global _ctrl_w_armed
+    with _ctrl_w_lock:
+        _ctrl_w_armed = False
+
+def _arm_ctrl_w():
+    global _ctrl_w_armed, _ctrl_w_timer
+    with _ctrl_w_lock:
+        _ctrl_w_armed = True
+        if _ctrl_w_timer:
+            _ctrl_w_timer.cancel()
+        # auto-disarm after 1.5s if no follow-up key
+        _ctrl_w_timer = threading.Timer(1.5, _disarm)
+        _ctrl_w_timer.start()
+    log("Ctrl+W armed — waiting for workspace number")
+
+def _key_to_ws(code):
+    """Return workspace number 1-16 from a key code, or None."""
+    from evdev import ecodes as e
+    mapping = {
+        e.KEY_1: 1,  e.KEY_2: 2,  e.KEY_3: 3,  e.KEY_4: 4,
+        e.KEY_5: 5,  e.KEY_6: 6,  e.KEY_7: 7,  e.KEY_8: 8,
+        e.KEY_9: 9,  e.KEY_0: 10,
+        e.KEY_A: 11, e.KEY_B: 12, e.KEY_C: 13,
+        e.KEY_D: 14, e.KEY_E: 15, e.KEY_F: 16,
+    }
+    return mapping.get(code)
+
+def ws_switch(num):
+    """Switch to tmux workspace number, creating it if needed."""
+    try:
+        # check session exists
+        r = subprocess.run(
+            ["tmux", "has-session", "-t", TMUX_SESSION],
+            capture_output=True
+        )
+        if r.returncode != 0:
+            log(f"workspace session not running, cannot switch")
+            return
+
+        # check if window exists
+        existing = subprocess.check_output(
+            ["tmux", "list-windows", "-t", TMUX_SESSION, "-F", "#{window_index}"],
+            text=True
+        ).split()
+
+        if str(num) not in existing:
+            total = len(existing)
+            if total >= MAX_WORKSPACES:
+                log(f"max workspaces reached, cannot create ws{num}")
+                return
+            subprocess.run(
+                ["tmux", "new-window", "-t", f"{TMUX_SESSION}:{num}", "-n", f"ws{num}"],
+                capture_output=True
+            )
+            log(f"created workspace {num}")
+
+        subprocess.run(
+            ["tmux", "select-window", "-t", f"{TMUX_SESSION}:{num}"],
+            capture_output=True
+        )
+        log(f"switched to workspace {num}")
+
+        # ensure spare in background
+        threading.Thread(target=_ensure_spare, daemon=True).start()
+
+    except Exception as ex:
+        log(f"ws_switch error: {ex}")
+
+def _ensure_spare():
+    """Keep at least one idle workspace pre-created."""
+    try:
+        existing = subprocess.check_output(
+            ["tmux", "list-windows", "-t", TMUX_SESSION, "-F", "#{window_index}"],
+            text=True
+        ).split()
+        total = len(existing)
+        if total >= MAX_WORKSPACES:
+            return
+        # count idle (no child processes)
+        idle = 0
+        for idx in existing:
+            try:
+                pane_pid = subprocess.check_output(
+                    ["tmux", "display-message", "-t", f"{TMUX_SESSION}:{idx}",
+                     "-p", "#{pane_pid}"],
+                    text=True
+                ).strip()
+                children = subprocess.run(
+                    ["pgrep", "-P", pane_pid],
+                    capture_output=True, text=True
+                ).stdout.strip()
+                if not children:
+                    idle += 1
+            except Exception:
+                pass
+        if idle < 1:
+            # find next free index
+            used = set(int(x) for x in existing)
+            for i in range(1, MAX_WORKSPACES + 1):
+                if i not in used:
+                    subprocess.run(
+                        ["tmux", "new-window", "-t", f"{TMUX_SESSION}:{i}",
+                         "-n", f"ws{i}"],
+                        capture_output=True
+                    )
+                    log(f"pre-created spare workspace {i}")
+                    break
+    except Exception as ex:
+        log(f"ensure_spare error: {ex}")
+
+# key code → action (for direct keys)
 KEY_MAP = {
     ecodes.KEY_VOLUMEUP:         vol_up,
     ecodes.KEY_VOLUMEDOWN:       vol_down,
@@ -718,18 +838,29 @@ KEY_MAP = {
     ecodes.KEY_MICMUTE:          mic_mute,
     ecodes.KEY_BRIGHTNESSUP:     bri_up,
     ecodes.KEY_BRIGHTNESSDOWN:   bri_down,
-    # some laptops use these instead
-    ecodes.KEY_F2:               None,  # not bound — avoid conflicts
+}
+
+# keys that matter for workspace chord (Ctrl+W then number/letter)
+WS_TRIGGER = ecodes.KEY_W
+WS_TARGETS = {
+    ecodes.KEY_1, ecodes.KEY_2, ecodes.KEY_3, ecodes.KEY_4,
+    ecodes.KEY_5, ecodes.KEY_6, ecodes.KEY_7, ecodes.KEY_8,
+    ecodes.KEY_9, ecodes.KEY_0,
+    ecodes.KEY_A, ecodes.KEY_B, ecodes.KEY_C,
+    ecodes.KEY_D, ecodes.KEY_E, ecodes.KEY_F,
 }
 
 def find_key_devices():
     devs = []
+    # build full set of codes we care about
+    all_codes = set(KEY_MAP.keys()) | {WS_TRIGGER} | WS_TARGETS | \
+                {ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL}
     for path in glob.glob("/dev/input/event*"):
         try:
             d = InputDevice(path)
             caps = d.capabilities()
-            keys = caps.get(ecodes.EV_KEY, [])
-            if any(k in keys for k in KEY_MAP):
+            keys = set(caps.get(ecodes.EV_KEY, []))
+            if keys & all_codes:
                 devs.append(d)
                 log(f"listening on {d.name} ({path})")
         except Exception:
@@ -741,19 +872,46 @@ if not devices:
     log("no suitable input devices found")
     sys.exit(1)
 
-import asyncio, selectors
+import asyncio
+
+# track ctrl held state
+_ctrl_held = False
 
 async def read_device(dev):
+    global _ctrl_w_armed, _ctrl_held
     async for event in dev.async_read_loop():
-        if event.type == ecodes.EV_KEY:
-            key = categorize(event)
-            if key.keystate == key.key_down:
-                action = KEY_MAP.get(event.code)
-                if action:
-                    try:
-                        action()
-                    except Exception as e:
-                        log(f"error handling key {event.code}: {e}")
+        if event.type != ecodes.EV_KEY:
+            continue
+        key = categorize(event)
+
+        # track ctrl
+        if event.code in (ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL):
+            _ctrl_held = (key.keystate != key.key_up)
+            continue
+
+        if key.keystate == key.key_down:
+            # Ctrl+W arms the chord
+            if event.code == WS_TRIGGER and _ctrl_held:
+                _arm_ctrl_w()
+                continue
+
+            # if armed, next number/letter = workspace switch
+            with _ctrl_w_lock:
+                armed = _ctrl_w_armed
+            if armed and event.code in WS_TARGETS:
+                _disarm()
+                ws_num = _key_to_ws(event.code)
+                if ws_num:
+                    threading.Thread(target=ws_switch, args=(ws_num,), daemon=True).start()
+                continue
+
+            # regular mapped key
+            action = KEY_MAP.get(event.code)
+            if action:
+                try:
+                    action()
+                except Exception as e:
+                    log(f"error handling key {event.code}: {e}")
 
 async def main():
     await asyncio.gather(*[read_device(d) for d in devices])
