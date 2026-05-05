@@ -1,4 +1,4 @@
-##!/usr/bin/env bash
+#!/usr/bin/env bash
 # sysctl.sh — system management TUI + hardware key daemon
 #
 # usage:
@@ -6,7 +6,7 @@
 #                                   configure prompt + MOTD (run once)
 #   ./sysctl.sh                   → interactive menu
 #   ttykit                        → interactive menu (after firstrun install)
-#   sudo ./sysctl.sh --keys       → run hardware key daemon (safe to call if already running)
+#   ./sysctl.sh --keys       → run hardware key daemon (safe to call if already running)
 #
 # quick info commands (no root needed):
 #   ./sysctl.sh bat               → battery status
@@ -22,8 +22,8 @@ set -euo pipefail
 VOLUME_STEP=5          # percent per keypress
 BRIGHTNESS_STEP=5      # percent per keypress
 NOTIFY_CMD=""          # auto-detected below
-KEY_DAEMON_PIDFILE="/var/run/sysctl-keys.pid"
-KEY_DAEMON_LOG="/var/log/sysctl-keys.log"
+KEY_DAEMON_PIDFILE="/home/$USER/.sysctl-keys.pid"
+KEY_DAEMON_LOG="/home/$USER/.sysctl-keys.log"
 
 # ─── colour helpers ────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -101,8 +101,6 @@ install_deps() {
             fi
         fi
     fi
-#rights for key daemon thing
-sudo usermod -aG video $USER
 #kmscon
 sudo systemctl disable getty@tty1 
 sudo systemctl enable kmscon.service 
@@ -110,7 +108,8 @@ sudo systemctl enable kmscon.service
     if check_cmd brightnessctl; then
         local user="${SUDO_USER:-$USER}"
         if ! groups "$user" | grep -q video; then
-            usermod -aG video "$user" 2>/dev/null || \
+           usermod -aG input "$user" 2>/dev/null 
+           usermod -aG video "$user" 2>/dev/null || \
                 warn "Could not add $user to video group — brightness may need sudo"
         fi
         # setuid bit as fallback
@@ -566,12 +565,12 @@ menu_keydaemon() {
                     rm -f "$KEY_DAEMON_PIDFILE"
                     ok "Daemon stopped"
                 else
-                    if [[ $EUID -ne 0 ]]; then
-                        warn "Starting daemon requires root. Running: sudo $0 --keys &"
-                        sudo "$0" --keys &
-                    else
-                        "$0" --keys &
-                    fi
+                   # if [[ $EUID -ne 0 ]]; then
+                     #   warn "Starting daemon requires root. Running: sudo $0 --keys &"
+                    #    sudo "$0" --keys &
+                   # else
+                     "$0" --keys &
+                   # fi
                     # wait for daemon to write its pidfile (up to 3s)
                     local waited=0
                     while [[ $waited -lt 10 ]]; do
@@ -596,10 +595,10 @@ menu_keydaemon() {
 
 # ─── hardware key daemon ──────────────────────────────────────────────────────
 # uses python3-evdev to listen on all input devices for key events
-# runs as root, but calls wpctl via the logged-in user's session bus
+# calls wpctl via the logged-in user's session bus
 
 run_key_daemon() {
-    [[ $EUID -ne 0 ]] && { err "Key daemon must run as root (use sudo $0 --keys)"; exit 1; }
+    #[[ $EUID -ne 0 ]] && { err "Key daemon must run as root (use sudo $0 --keys)"; exit 1; }
 
     # ── guard: exit silently if already running ────────────────────────────────
     if [[ -f "$KEY_DAEMON_PIDFILE" ]]; then
@@ -1041,16 +1040,7 @@ _motd_net() {
     fi
 }
 
-_motd_ws() {
-    local session="workspaces"
-    if tmux has-session -t "$session" 2>/dev/null; then
-        local wins
-        wins=$(tmux list-windows -t "$session" -F "#{window_index}" 2>/dev/null | tr '\n' ' ')
-        echo "active  [${wins% }]"
-    else
-        echo "not started"
-    fi
-}
+
 
 R='\033[0m'; BD='\033[1m'; DIM='\033[2m'
 C1='\033[38;5;39m'   # sky blue
@@ -1072,26 +1062,22 @@ echo -e "${R}"
 # ── stats ─────────────────────────────────────────────────────────────────────
 local_ip=$(_motd_net)
 bat_info=$(_motd_bat)
-ws_info=$(_motd_ws)
 uptime_str=$(uptime -p 2>/dev/null | sed 's/up //')
 load_str=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)
 kernel=$(uname -r)
 now=$(date '+%a %d %b  %H:%M')
 
 echo -e "  ${C3}┌──────────────────────────────────────────┐${R}"
-printf  "  ${C3}│${R}  ${BD}%-14s${R}  ${CG}%-26s${C3}│${R}\n" "host"     "$(hostname)"
-printf  "  ${C3}│${R}  ${BD}%-14s${R}  ${CY}%-26s${C3}│${R}\n" "time"     "$now"
-printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}│${R}\n"      "uptime"   "$uptime_str"
-printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}│${R}\n"      "load"     "$load_str"
-printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}│${R}\n"      "kernel"   "$kernel"
+printf  "  ${C3}│${R}  ${BD}%-14s${R}  ${CG}%-26s${C3}${R}\n" "host"     "$(hostname)"
+printf  "  ${C3}│${R}  ${BD}%-14s${R}  ${CY}%-26s${C3}${R}\n" "time"     "$now"
+printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}${R}\n"      "uptime"   "$uptime_str"
+printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}${R}\n"      "load"     "$load_str"
+printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}${R}\n"      "kernel"   "$kernel"
 echo -e "  ${C3}├──────────────────────────────────────────┤${R}"
-printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}│${R}\n"      "network"  "$local_ip"
-printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}│${R}\n"      "battery"  "$bat_info"
-printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}│${R}\n"      "workspaces" "$ws_info"
+printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}${R}\n"      "network"  "$local_ip"
+printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}${R}\n"      "battery"  "$bat_info"
 echo -e "  ${C3}└──────────────────────────────────────────┘${R}"
-echo -e "  ${DIM}Ctrl+W → 1-9/0/a-f   switch workspace${R}"
-echo -e "  ${DIM}./sysctl.sh           system controls${R}"
-echo
+echo -e "  ${DIM}ttykit           system controls${R}"
 MOTD_SCRIPT
 
     chmod +x "$motd_script"
@@ -1176,7 +1162,7 @@ BASHRC
             "$KEY_DAEMON_PIDFILE" "$KEY_DAEMON_PIDFILE" >> "$bashrc"
         printf '    : # already running\n' >> "$bashrc"
         printf 'else\n' >> "$bashrc"
-        printf '    sudo "%s" --keys &>/dev/null &\n' "$script_dst" >> "$bashrc"
+        printf '    "%s" --keys &>/dev/null &\n' "$script_dst" >> "$bashrc"
         printf 'fi\n' >> "$bashrc"
         printf '# ttykit-keydaemon-end\n' >> "$bashrc"
         ok "Key daemon autostart added to ${bashrc}"
