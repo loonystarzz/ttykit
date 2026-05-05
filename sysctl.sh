@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+##!/usr/bin/env bash
 # sysctl.sh — system management TUI + hardware key daemon
 #
 # usage:
@@ -47,8 +47,8 @@ install_deps() {
     check_cmd wpctl            || pkgs+=(wireplumber pipewire-utils)
     check_cmd nmcli            || pkgs+=(NetworkManager)
     check_cmd fzf              || pkgs+=(fzf)
+    check_cmd kmscon           || pkgs+=(kmscon)
     check_cmd python3          || pkgs+=(python3)
-    check_cmd tmux             || pkgs+=(tmux)
     # python3-evdev for key daemon
     python3 -c "import evdev" 2>/dev/null || pkgs+=(python3-evdev)
     # whiptail for TUI
@@ -99,7 +99,11 @@ install_deps() {
             fi
         fi
     fi
-
+#rights for key daemon thing
+sudo usermod -aG video $USER
+#kmscon
+sudo systemctl disable getty@tty1 
+sudo systemctl enable kmscon.service 
     # allow brightnessctl without sudo for current user
     if check_cmd brightnessctl; then
         local user="${SUDO_USER:-$USER}"
@@ -542,8 +546,7 @@ menu_keydaemon() {
             --menu "Status: $( $running && echo RUNNING || echo STOPPED)" 15 55 5 \
             "1" "$( $running && echo 'Stop daemon' || echo 'Start daemon (requires root)')" \
             "2" "View log" \
-            "3" "Install as systemd service" \
-            "4" "Remove systemd service" \
+            "3" "Autostart enable" \
             "b" "← Back" \
             3>&1 1>&2 2>&3) || return
 
@@ -584,45 +587,9 @@ menu_keydaemon() {
                 tail -40 "$KEY_DAEMON_LOG" 2>/dev/null || echo "(no log yet)"
                 echo; read -rp "Press enter..."
                 ;;
-            3) install_systemd_service ;;
-            4) remove_systemd_service  ;;
             b) return ;;
         esac
     done
-}
-
-# ─── systemd service install ──────────────────────────────────────────────────
-SERVICE_FILE="/etc/systemd/system/sysctl-keys.service"
-SCRIPT_PATH="$(realpath "$0")"
-
-install_systemd_service() {
-    [[ $EUID -ne 0 ]] && { warn "Need root to install service"; return 1; }
-    cat > "$SERVICE_FILE" <<EOF
-[Unit]
-Description=Hardware key daemon (volume/brightness)
-After=multi-user.target
-
-[Service]
-Type=simple
-ExecStart=$SCRIPT_PATH --keys
-Restart=on-failure
-StandardOutput=append:$KEY_DAEMON_LOG
-StandardError=append:$KEY_DAEMON_LOG
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable --now sysctl-keys.service
-    ok "Service installed and started"
-}
-
-remove_systemd_service() {
-    [[ $EUID -ne 0 ]] && { warn "Need root to remove service"; return 1; }
-    systemctl disable --now sysctl-keys.service 2>/dev/null || true
-    rm -f "$SERVICE_FILE"
-    systemctl daemon-reload
-    ok "Service removed"
 }
 
 # ─── hardware key daemon ──────────────────────────────────────────────────────
