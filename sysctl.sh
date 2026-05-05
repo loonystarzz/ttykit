@@ -2,9 +2,11 @@
 # sysctl.sh — system management TUI + hardware key daemon
 #
 # usage:
-#   sudo ./sysctl.sh --firstrun   → install deps + configure prompt (run once)
+#   sudo ./sysctl.sh --firstrun   → install deps, self-install to ~/.local/bin/ttykit,
+#                                   configure prompt + MOTD (run once)
 #   ./sysctl.sh                   → interactive menu
-#   sudo ./sysctl.sh --keys       → run hardware key daemon
+#   ttykit                        → interactive menu (after firstrun install)
+#   sudo ./sysctl.sh --keys       → run hardware key daemon (safe to call if already running)
 #
 # quick info commands (no root needed):
 #   ./sysctl.sh bat               → battery status
@@ -599,6 +601,18 @@ menu_keydaemon() {
 run_key_daemon() {
     [[ $EUID -ne 0 ]] && { err "Key daemon must run as root (use sudo $0 --keys)"; exit 1; }
 
+    # ── guard: exit silently if already running ────────────────────────────────
+    if [[ -f "$KEY_DAEMON_PIDFILE" ]]; then
+        local _existing_pid
+        _existing_pid=$(cat "$KEY_DAEMON_PIDFILE" 2>/dev/null)
+        if [[ -n "$_existing_pid" ]] && kill -0 "$_existing_pid" 2>/dev/null; then
+            echo "[$(date)] Key daemon already running (pid ${_existing_pid}) — exiting" >> "$KEY_DAEMON_LOG"
+            exit 0
+        fi
+        # stale pidfile — remove it and continue
+        rm -f "$KEY_DAEMON_PIDFILE"
+    fi
+
     echo $$ > "$KEY_DAEMON_PIDFILE"
     echo "[$(date)] Key daemon started (pid $$)" >> "$KEY_DAEMON_LOG"
 
@@ -1098,6 +1112,71 @@ BASHRC
     fi
 }
 
+# ─── ttykit self-install ──────────────────────────────────────────────────────
+# Copies sysctl.sh to ~/.local/bin/ttykit/sysctl.sh and creates a symlink at
+# ~/.local/bin/ttykit pointing to it.  Also wires the key daemon into .bashrc.
+setup_ttykit() {
+    local target_user="${SUDO_USER:-$USER}"
+    local home
+    home=$(eval echo "~${target_user}")
+    local bin_dir="${home}/.local/bin"
+    local kit_dir="${bin_dir}/ttykit"
+    local script_dst="${kit_dir}/sysctl.sh"
+    local symlink_dst="${bin_dir}/ttykit"
+
+    # resolve the actual path of the currently running script
+    local script_src
+    script_src=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}")
+
+    mkdir -p "$kit_dir"
+
+    # copy the script into the kit dir
+    install -m 755 "$script_src" "$script_dst"
+    chown "${target_user}:${target_user}" "$script_dst" 2>/dev/null || true
+    ok "Installed → ${script_dst}"
+
+    # create / update the ~/.local/bin/ttykit symlink
+    # (if the path exists and is already the kit dir itself, skip)
+    if [[ -L "$symlink_dst" ]]; then
+        rm -f "$symlink_dst"
+    fi
+    ln -sf "$script_dst" "$symlink_dst"
+    chown -h "${target_user}:${target_user}" "$symlink_dst" 2>/dev/null || true
+    ok "Symlink → ${symlink_dst} → ${script_dst}"
+
+    # ensure ~/.local/bin is on PATH in .bashrc
+    local bashrc="${home}/.bashrc"
+    local path_marker="# ttykit-path"
+    if ! grep -q "$path_marker" "$bashrc" 2>/dev/null; then
+        cat >> "$bashrc" <<BASHRC
+
+${path_marker}
+export PATH="\${HOME}/.local/bin:\${PATH}"
+# ttykit-path-end
+BASHRC
+        ok "Added ~/.local/bin to PATH in ${bashrc}"
+    fi
+
+    # wire the key daemon autostart into .bashrc
+    local daemon_marker="# ttykit-keydaemon"
+    if ! grep -q "$daemon_marker" "$bashrc" 2>/dev/null; then
+        cat >> "$bashrc" <<BASHRC
+
+${daemon_marker}
+# Auto-start hardware key daemon (only if not already running)
+if [[ -f "${KEY_DAEMON_PIDFILE}" ]] && kill -0 "\$(cat "${KEY_DAEMON_PIDFILE}" 2>/dev/null)" 2>/dev/null; then
+    : # already running
+else
+    sudo "${script_dst}" --keys &>/dev/null &
+fi
+# ttykit-keydaemon-end
+BASHRC
+        ok "Key daemon autostart added to ${bashrc}"
+    else
+        warn "Key daemon autostart already in ${bashrc} — skipping"
+    fi
+}
+
 # ─── first-run ────────────────────────────────────────────────────────────────
 first_run() {
     [[ $EUID -ne 0 ]] && { err "Run --firstrun with sudo"; exit 1; }
@@ -1109,7 +1188,7 @@ first_run() {
     echo
 
     # ── step 1: packages ────────────────────────────────────────────────────
-    echo -e "${BOLD}Step 1/3 — System packages${RESET}"
+    echo -e "${BOLD}Step 1/4 — System packages${RESET}"
     echo "  Will install: brightnessctl alsa-utils wireplumber pipewire-utils"
     echo "                NetworkManager fzf python3 tmux python3-evdev newt"
     echo "                pipewire-pulse  + bluetuith from GitHub"
@@ -1121,8 +1200,35 @@ first_run() {
     fi
     echo
 
-    # ── step 2: prompt ──────────────────────────────────────────────────────
-    echo -e "${BOLD}Step 2/3 — Custom bash prompt${RESET}"
+    # ── step 2: ttykit self-install ─────────────────────────────────────────
+    echo -e "${BOLD}Step 2/4 — Install / update ttykit${RESET}"
+    local target_user="${SUDO_USER:-$USER}"
+    local home; home=$(eval echo "~${target_user}")
+    local kit_dir="${home}/.local/bin/ttykit"
+    local script_dst="${kit_dir}/sysctl.sh"
+    if [[ -f "$script_dst" ]]; then
+        echo "  ttykit is already installed at ${script_dst}."
+        echo "  Choosing 'yes' will overwrite it with this version."
+        if _ask_yn "Overwrite / update ttykit?"; then
+            setup_ttykit
+        else
+            warn "Skipping ttykit install"
+        fi
+    else
+        echo "  Copies this script to ~/.local/bin/ttykit/sysctl.sh,"
+        echo "  creates a ~/.local/bin/ttykit symlink, and wires the key"
+        echo "  daemon to start automatically on login."
+        echo
+        if _ask_yn "Install ttykit to ~/.local/bin?"; then
+            setup_ttykit
+        else
+            warn "Skipping ttykit install"
+        fi
+    fi
+    echo
+
+    # ── step 3: prompt ──────────────────────────────────────────────────────
+    echo -e "${BOLD}Step 3/4 — Custom bash prompt${RESET}"
     echo "  Adds a prompt showing:  user@host : battery% : HH:MM : cwd"
     echo
     if _ask_yn "Set up custom bash prompt?"; then
@@ -1132,8 +1238,8 @@ first_run() {
     fi
     echo
 
-    # ── step 3: motd ────────────────────────────────────────────────────────
-    echo -e "${BOLD}Step 3/3 — Login MOTD${RESET}"
+    # ── step 4: motd ────────────────────────────────────────────────────────
+    echo -e "${BOLD}Step 4/4 — Login MOTD${RESET}"
     echo "  Adds a status banner (host, time, battery, network, workspaces)"
     echo "  shown every time you open a new terminal."
     echo
