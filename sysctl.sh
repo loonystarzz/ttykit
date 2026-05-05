@@ -1160,17 +1160,19 @@ BASHRC
     # wire the key daemon autostart into .bashrc
     local daemon_marker="# ttykit-keydaemon"
     if ! grep -q "$daemon_marker" "$bashrc" 2>/dev/null; then
-        cat >> "$bashrc" <<BASHRC
-
-${daemon_marker}
-# Auto-start hardware key daemon (only if not already running)
-if [[ -f "${KEY_DAEMON_PIDFILE}" ]] && kill -0 "\$(cat "${KEY_DAEMON_PIDFILE}" 2>/dev/null)" 2>/dev/null; then
-    : # already running
-else
-    sudo "${script_dst}" --keys &>/dev/null &
-fi
-# ttykit-keydaemon-end
-BASHRC
+        # Use printf to avoid heredoc variable-expansion and nested-quote issues.
+        # $script_dst and $KEY_DAEMON_PIDFILE are expanded NOW (correct — we want
+        # the installed path baked in); $() and $? must be literal in the shell
+        # code we're writing, so they are escaped.
+        printf '\n%s\n' "$daemon_marker" >> "$bashrc"
+        printf '# Auto-start hardware key daemon (only if not already running)\n' >> "$bashrc"
+        printf 'if [[ -f "%s" ]] && kill -0 "$(cat "%s" 2>/dev/null)" 2>/dev/null; then\n' \
+            "$KEY_DAEMON_PIDFILE" "$KEY_DAEMON_PIDFILE" >> "$bashrc"
+        printf '    : # already running\n' >> "$bashrc"
+        printf 'else\n' >> "$bashrc"
+        printf '    sudo "%s" --keys &>/dev/null &\n' "$script_dst" >> "$bashrc"
+        printf 'fi\n' >> "$bashrc"
+        printf '# ttykit-keydaemon-end\n' >> "$bashrc"
         ok "Key daemon autostart added to ${bashrc}"
     else
         warn "Key daemon autostart already in ${bashrc} — skipping"
