@@ -1113,14 +1113,16 @@ BASHRC
 }
 
 # ─── ttykit self-install ──────────────────────────────────────────────────────
-# Copies sysctl.sh to ~/.local/bin/ttykit/sysctl.sh and creates a symlink at
-# ~/.local/bin/ttykit pointing to it.  Also wires the key daemon into .bashrc.
+# Copies sysctl.sh to ~/.local/bin/.ttykit-bin/sysctl.sh and creates a symlink
+# at ~/.local/bin/ttykit pointing to it.  Also wires the key daemon into .bashrc.
 setup_ttykit() {
     local target_user="${SUDO_USER:-$USER}"
     local home
     home=$(eval echo "~${target_user}")
     local bin_dir="${home}/.local/bin"
-    local kit_dir="${bin_dir}/ttykit"
+    # Store the actual script in a dot-prefixed subdir so its name never
+    # collides with the ~/.local/bin/ttykit symlink we create alongside it.
+    local kit_dir="${bin_dir}/.ttykit-bin"
     local script_dst="${kit_dir}/sysctl.sh"
     local symlink_dst="${bin_dir}/ttykit"
 
@@ -1129,6 +1131,7 @@ setup_ttykit() {
     script_src=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}")
 
     mkdir -p "$kit_dir"
+    chown "${target_user}:${target_user}" "$kit_dir" 2>/dev/null || true
 
     # copy the script into the kit dir
     install -m 755 "$script_src" "$script_dst"
@@ -1136,10 +1139,13 @@ setup_ttykit() {
     ok "Installed → ${script_dst}"
 
     # create / update the ~/.local/bin/ttykit symlink
-    # (if the path exists and is already the kit dir itself, skip)
-    if [[ -L "$symlink_dst" ]]; then
-        rm -f "$symlink_dst"
+    # If a real directory exists there we cannot overwrite it with ln — warn and bail.
+    if [[ -d "$symlink_dst" && ! -L "$symlink_dst" ]]; then
+        warn "Cannot create symlink at ${symlink_dst} — a real directory exists there."
+        warn "Remove it manually first: rm -rf ${symlink_dst}"
+        return 1
     fi
+    rm -f "$symlink_dst"   # remove stale symlink or stale file
     ln -sf "$script_dst" "$symlink_dst"
     chown -h "${target_user}:${target_user}" "$symlink_dst" 2>/dev/null || true
     ok "Symlink → ${symlink_dst} → ${script_dst}"
@@ -1206,7 +1212,7 @@ first_run() {
     echo -e "${BOLD}Step 2/4 — Install / update ttykit${RESET}"
     local target_user="${SUDO_USER:-$USER}"
     local home; home=$(eval echo "~${target_user}")
-    local kit_dir="${home}/.local/bin/ttykit"
+    local kit_dir="${home}/.local/bin/.ttykit-bin"
     local script_dst="${kit_dir}/sysctl.sh"
     if [[ -f "$script_dst" ]]; then
         echo "  ttykit is already installed at ${script_dst}."
