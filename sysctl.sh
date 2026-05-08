@@ -578,7 +578,7 @@ run_key_daemon() {
     echo "[$(date)] Key daemon started (pid $$)" >> "$KEY_DAEMON_LOG"
 
     python3 - <<'PYEOF' "$VOLUME_STEP" "$BRIGHTNESS_STEP" "$KEY_DAEMON_LOG" "$TMUX_SESSION"
-import sys, subprocess, os, time, glob, threading
+import sys, subprocess, os, time, glob, threading, asyncio, signal
 
 vol_step     = sys.argv[1]
 bri_step     = sys.argv[2]
@@ -587,7 +587,7 @@ tmux_session = sys.argv[4]
 
 try:
     import evdev
-    from evdev import InputDevice, categorize, ecodes
+    from evdev import InputDevice, UInput, categorize, ecodes
 except ImportError:
     print("python3-evdev not installed", flush=True)
     sys.exit(1)
@@ -602,10 +602,10 @@ def log(msg):
     except Exception:
         pass
 
+# ── helpers (unchanged) ───────────────────────────────────────────────────────
 def get_session_user():
     try:
-        out = subprocess.check_output(
-            ["loginctl", "list-sessions", "--no-legend"], text=True)
+        out = subprocess.check_output(["loginctl", "list-sessions", "--no-legend"], text=True)
         for line in out.splitlines():
             parts = line.split()
             if len(parts) >= 3 and parts[2] != "root":
@@ -628,33 +628,14 @@ def as_user(*cmd):
         env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path=/run/user/{uid}/bus"
     return subprocess.run(["sudo", "-u", user] + list(cmd), env=env, capture_output=True)
 
-def vol_up():
-    as_user("wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{vol_step}%+")
-    log("volume up")
+def vol_up():    as_user("wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{vol_step}%+"); log("volume up")
+def vol_down():  as_user("wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{vol_step}%-"); log("volume down")
+def vol_mute():  as_user("wpctl", "set-mute",   "@DEFAULT_AUDIO_SINK@", "toggle");        log("volume mute toggle")
+def mic_mute():  as_user("wpctl", "set-mute",   "@DEFAULT_AUDIO_SOURCE@", "toggle");      log("mic mute toggle")
+def bri_up():    subprocess.run(["brightnessctl", "set", f"{bri_step}%+", "-q"]);         log("brightness up")
+def bri_down():  subprocess.run(["brightnessctl", "set", f"{bri_step}%-", "-q"]);         log("brightness down")
 
-def vol_down():
-    as_user("wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{vol_step}%-")
-    log("volume down")
-
-def vol_mute():
-    as_user("wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle")
-    log("volume mute toggle")
-
-def mic_mute():
-    as_user("wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle")
-    log("mic mute toggle")
-
-def bri_up():
-    subprocess.run(["brightnessctl", "set", f"{bri_step}%+", "-q"])
-    log("brightness up")
-
-def bri_down():
-    subprocess.run(["brightnessctl", "set", f"{bri_step}%-", "-q"])
-    log("brightness down")
-
-# ── tmux workspace switching (Meta/Super + 1-4) ───────────────────────────────
 def ws_switch(num):
-    """Switch to tmux window number (1-4)."""
     try:
         user = get_session_user()
         uid = None
@@ -663,108 +644,128 @@ def ws_switch(num):
                 uid = int(subprocess.check_output(["id", "-u", user], text=True).strip())
             except Exception:
                 pass
-
         env = os.environ.copy()
         if uid:
             env["TMUX_TMPDIR"] = f"/tmp/tmux-{uid}"
 
         def tmux(*args):
-            return subprocess.run(["tmux"] + list(args),
-                                   capture_output=True, text=True, env=env)
-
+            return subprocess.run(["tmux"] + list(args), capture_output=True, text=True, env=env)
         def tmux_out(*args):
             return subprocess.check_output(["tmux"] + list(args), text=True, env=env)
 
-        # session must exist (started by bashrc snippet on login)
         r = tmux("has-session", "-t", tmux_session)
         if r.returncode != 0:
-            log(f"tmux session '{tmux_session}' not found — is it running?")
+            log(f"tmux session '{tmux_session}' not found")
             return
-
-        existing = tmux_out("list-windows", "-t", tmux_session,
-                            "-F", "#{window_index}").split()
-
+        existing = tmux_out("list-windows", "-t", tmux_session, "-F", "#{window_index}").split()
         if str(num) not in existing:
             tmux("new-window", "-t", f"{tmux_session}:{num}", "-n", f"ws{num}")
             log(f"created workspace {num}")
-
         tmux("select-window", "-t", f"{tmux_session}:{num}")
         log(f"switched to workspace {num}")
-
     except Exception as ex:
         log(f"ws_switch error: {ex}")
 
 # ── key maps ──────────────────────────────────────────────────────────────────
 KEY_MAP = {
-    ecodes.KEY_VOLUMEUP:      vol_up,
-    ecodes.KEY_VOLUMEDOWN:    vol_down,
-    ecodes.KEY_MUTE:          vol_mute,
-    ecodes.KEY_MICMUTE:       mic_mute,
-    ecodes.KEY_BRIGHTNESSUP:  bri_up,
+    ecodes.KEY_VOLUMEUP:       vol_up,
+    ecodes.KEY_VOLUMEDOWN:     vol_down,
+    ecodes.KEY_MUTE:           vol_mute,
+    ecodes.KEY_MICMUTE:        mic_mute,
+    ecodes.KEY_BRIGHTNESSUP:   bri_up,
     ecodes.KEY_BRIGHTNESSDOWN: bri_down,
 }
-
-# Meta (Super/Windows) + 1-4 workspace keys
-WS_KEYS = {
-    ecodes.KEY_1: 1,
-    ecodes.KEY_2: 2,
-    ecodes.KEY_3: 3,
-    ecodes.KEY_4: 4,
-}
-
-# Meta modifier keycodes to track
+WS_KEYS = {ecodes.KEY_1: 1, ecodes.KEY_2: 2, ecodes.KEY_3: 3, ecodes.KEY_4: 4}
 META_KEYS = {ecodes.KEY_LEFTMETA, ecodes.KEY_RIGHTMETA}
 
-def find_key_devices():
+# ── device discovery — grab everything, re-inject non-meta combos ─────────────
+def find_all_devices():
     devs = []
-    all_codes = (set(KEY_MAP.keys()) | set(WS_KEYS.keys()) | META_KEYS)
-    for path in glob.glob("/dev/input/event*"):
+    want = META_KEYS | set(WS_KEYS) | set(KEY_MAP)
+    for path in sorted(glob.glob("/dev/input/event*")):
         try:
             d = InputDevice(path)
-            caps = d.capabilities()
-            keys = set(caps.get(ecodes.EV_KEY, []))
-            if keys & all_codes:
+            keys = set(d.capabilities().get(ecodes.EV_KEY, []))
+            if keys & want:
                 devs.append(d)
                 log(f"listening on {d.name} ({path})")
         except Exception:
             pass
     return devs
 
-devices = find_key_devices()
+devices = find_all_devices()
 if not devices:
     log("no suitable input devices found")
     sys.exit(1)
 
-import asyncio
+# ── uinput passthrough — re-injects suppressed events back into kernel ─────────
+# Collect all key caps from grabbed devices so uinput can re-emit anything
+all_keys = set()
+for d in devices:
+    all_keys |= set(d.capabilities().get(ecodes.EV_KEY, []))
 
+ui = UInput({ecodes.EV_KEY: list(all_keys)}, name="ttykit-passthrough")
+
+def reinject(event):
+    """Send event back into kernel as if it came from a normal keyboard."""
+    ui.write(ecodes.EV_KEY, event.code, event.value)
+    ui.syn()
+
+# ── global meta state ─────────────────────────────────────────────────────────
 _meta_held = False
 
+# grab all devices upfront — re-inject everything we don't handle
+for d in devices:
+    try:
+        d.grab()
+    except Exception as e:
+        log(f"grab failed for {d.name}: {e}")
+
+def _cleanup(sig=None, frame=None):
+    for d in devices:
+        try:
+            d.ungrab()
+        except Exception:
+            pass
+    try:
+        ui.close()
+    except Exception:
+        pass
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, _cleanup)
+signal.signal(signal.SIGINT, _cleanup)
+
+# ── per-device async reader ───────────────────────────────────────────────────
 async def read_device(dev):
     global _meta_held
     async for event in dev.async_read_loop():
         if event.type != ecodes.EV_KEY:
             continue
-        key = categorize(event)
 
-        # track Meta (Super / Windows key) held state
+        # Meta key — track state, suppress from terminal
         if event.code in META_KEYS:
-            _meta_held = (key.keystate != key.key_up)
+            _meta_held = (event.value != 0)  # 0=up, 1=down, 2=repeat
+            # don't reinject — Meta alone should do nothing in terminal
             continue
 
-        if key.keystate == key.key_down:
-            # Meta + 1-4 → workspace switch
-            if _meta_held and event.code in WS_KEYS:
-                num = WS_KEYS[event.code]
-                threading.Thread(target=ws_switch, args=(num,), daemon=True).start()
-                continue
+        # Meta + workspace number — handle, suppress
+        if _meta_held and event.code in WS_KEYS and event.value == 1:
+            num = WS_KEYS[event.code]
+            threading.Thread(target=ws_switch, args=(num,), daemon=True).start()
+            continue
 
-            # regular mapped keys (media keys etc.)
-            action = KEY_MAP.get(event.code)
-            if action:
-                try:
-                    action()
-                except Exception as e:
-                    log(f"error handling key {event.code}: {e}")
+        # Media/brightness keys — handle, suppress
+        if event.code in KEY_MAP and event.value == 1:
+            action = KEY_MAP[event.code]
+            try:
+                action()
+            except Exception as e:
+                log(f"error handling key {event.code}: {e}")
+            continue
+
+        # Everything else — reinject so terminal gets it normally
+        reinject(event)
 
 async def main():
     await asyncio.gather(*[read_device(d) for d in devices])
