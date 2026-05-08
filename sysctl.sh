@@ -988,7 +988,7 @@ BASHRC
             "$KEY_DAEMON_PIDFILE" "$KEY_DAEMON_PIDFILE" >> "$bashrc"
         printf '    : # already running\n' >> "$bashrc"
         printf 'else\n' >> "$bashrc"
-        printf '    "%s" --keys &>/dev/null &\n' "$script_dst" >> "$bashrc"
+        printf '    "exec %s" --keys &>/dev/null \n' "$script_dst" >> "$bashrc"
         printf 'fi\n' >> "$bashrc"
         printf '# ttykit-keydaemon-end\n' >> "$bashrc"
         ok "Key daemon autostart added to ${bashrc}"
