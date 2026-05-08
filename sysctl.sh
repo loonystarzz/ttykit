@@ -24,6 +24,7 @@ TMUX_SESSION="workspaces"
 NUM_WORKSPACES=4
 KEYD_CONF="/etc/keyd/default.conf"
 
+echo "running as user" $(whoami) "(has to be ur current user!!)"
 # ─── colour helpers ────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
@@ -206,10 +207,9 @@ write_keyd_conf() {
 # workspace switching — Meta+1 through Meta+${NUM_WORKSPACES}
 ${ws_bindings}
 # volume
-volumeup   = command(wpctl set-volume @DEFAULT_AUDIO_SINK@ ${VOLUME_STEP}%+)
-volumedown = command(wpctl set-volume @DEFAULT_AUDIO_SINK@ ${VOLUME_STEP}%-)
-mute       = command(wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle)
-micmute    = command(wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle)
+volumeup   = command(su ${SUDO_USER} -c 'amixer set Master ${VOLUME_STEP}%+')
+volumedown = command(su ${SUDO_USER} -c 'amixer set Master ${VOLUME_STEP}%-')
+mute       = command(su ${SUDO_USER} -c 'amixer set Master toggle')
 
 # brightness
 brightnessup   = command(brightnessctl set ${BRIGHTNESS_STEP}%+)
