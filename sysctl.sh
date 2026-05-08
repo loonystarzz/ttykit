@@ -608,15 +608,8 @@ def log(msg):
 
 # ── helpers (unchanged) ───────────────────────────────────────────────────────
 def get_session_user():
-    try:
-        out = subprocess.check_output(["loginctl", "list-sessions", "--no-legend"], text=True)
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) >= 3 and parts[2] != "root":
-                return parts[2]
-    except Exception:
-        pass
-    return os.environ.get("SUDO_USER") or ""
+    SESSION_USER = os.environ.get("SUDO_USER") or os.environ.get("USER") or ""
+    SESSION_UID  = int(subprocess.check_output(["id", "-u", SESSION_USER], text=True).strip()) if SESSION_USER else os.getuid()
 
 def as_user(*cmd):
     user = get_session_user()
