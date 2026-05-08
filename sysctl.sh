@@ -99,12 +99,61 @@ install_deps() {
     ok "Packages done"
 }
 
-install_kmscon() {
-    hdr "Setting up kmscon"
-    check_cmd kmscon || dnf install -y kmscon
-    systemctl disable getty@tty1 2>/dev/null || true
-    systemctl enable --now kmscon.service
-    ok "kmscon enabled"
+# ─── Xorg + kitty + openbox GUI setup ────────────────────────────────────────
+install_xorg_gui() {
+    hdr "Setting up Xorg + kitty + openbox"
+
+    local pkgs=()
+    check_cmd Xorg   || pkgs+=(xorg-x11-server-Xorg xorg-x11-xinit)
+    check_cmd kitty  || pkgs+=(kitty)
+    check_cmd openbox || pkgs+=(openbox)
+
+    if [[ ${#pkgs[@]} -gt 0 ]]; then
+        echo "Installing: ${pkgs[*]}"
+        dnf install -y "${pkgs[@]}"
+    else
+        ok "Xorg/kitty/openbox already installed"
+    fi
+
+    local target_user="${SUDO_USER:-$USER}"
+    local home; home=$(eval echo "~${target_user}")
+    local xinitrc="${home}/.xinitrc"
+
+    cat > "$xinitrc" <<'XINITRC'
+kitty --start-as fullscreen &
+exec openbox-session
+XINITRC
+
+    chown "${target_user}:${target_user}" "$xinitrc" 2>/dev/null || true
+    chmod 644 "$xinitrc"
+    ok "~/.xinitrc written"
+
+    ok "Xorg/kitty/openbox setup complete"
+}
+
+# ─── startx on TTY login (bashrc) ─────────────────────────────────────────────
+setup_startx_bashrc() {
+    local target_user="${SUDO_USER:-$USER}"
+    local home; home=$(eval echo "~${target_user}")
+    local bashrc="${home}/.bashrc"
+    local marker="# ttykit-startx"
+
+    if grep -q "$marker" "$bashrc" 2>/dev/null; then
+        warn "startx autostart already in ${bashrc} — skipping"
+        return
+    fi
+
+    cat >> "$bashrc" <<'BASHRC'
+
+# ttykit-startx
+# start X automatically when logging in on a TTY (not inside tmux/screen/SSH)
+if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" && "$(tty)" == /dev/tty* && -z "${TMUX:-}" && -z "${STY:-}" && -z "${SSH_CONNECTION:-}" ]]; then
+    exec startx
+fi
+# ttykit-startx-end
+BASHRC
+
+    ok "startx TTY autostart added to ${bashrc}"
 }
 
 # ─── keyd install + config ────────────────────────────────────────────────────
@@ -841,13 +890,16 @@ first_run() {
     fi
     echo
 
-    # step 2: kmscon
-    echo -e "${BOLD}Step 2/6 — kmscon (GPU-accelerated TTY)${RESET}"
-    echo "  Disables getty@tty1, enables kmscon.service."
-    if _ask_yn "Switch to kmscon?"; then
-        install_kmscon
+    # step 2: Xorg + kitty + openbox
+    echo -e "${BOLD}Step 2/6 — Xorg + kitty + openbox (GUI terminal)${RESET}"
+    echo "  Installs Xorg, kitty, openbox, xinit."
+    echo "  Writes ~/.xinitrc to launch kitty fullscreen under openbox."
+    echo "  Adds startx autostart to ~/.bashrc (TTY login only)."
+    if _ask_yn "Set up Xorg GUI terminal?"; then
+        install_xorg_gui
+        setup_startx_bashrc
     else
-        warn "Skipping kmscon"
+        warn "Skipping Xorg GUI setup"
     fi
     echo
 
