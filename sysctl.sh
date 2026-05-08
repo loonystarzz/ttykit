@@ -24,6 +24,8 @@ BRIGHTNESS_STEP=5      # percent per keypress
 NOTIFY_CMD=""          # auto-detected below
 KEY_DAEMON_PIDFILE="/home/$USER/.sysctl-keys.pid"
 KEY_DAEMON_LOG="/home/$USER/.sysctl-keys.log"
+TMUX_SESSION="workspaces"
+NUM_WORKSPACES=4
 
 # ─── colour helpers ────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -51,11 +53,9 @@ install_deps() {
     check_cmd fzf              || pkgs+=(fzf)
     check_cmd kmscon           || pkgs+=(kmscon)
     check_cmd python3          || pkgs+=(python3)
-    # python3-evdev for key daemon
+    check_cmd tmux             || pkgs+=(tmux)
     python3 -c "import evdev" 2>/dev/null || pkgs+=(python3-evdev)
-    # whiptail for TUI
     check_cmd whiptail         || pkgs+=(newt)
-    # pactl as fallback audio info
     check_cmd pactl            || pkgs+=(pipewire-pulse)
 
     if [[ ${#pkgs[@]} -gt 0 ]]; then
@@ -75,7 +75,6 @@ install_deps() {
         echo "Installing bluetuith from GitHub releases..."
         local arch
         arch=$(uname -m)
-        # map uname arch to release archive naming
         case "$arch" in
             x86_64)  arch="x86_64"  ;;
             aarch64) arch="arm64"   ;;
@@ -84,10 +83,8 @@ install_deps() {
         esac
         if [[ -n "$arch" ]]; then
             local tag url tmp
-            # get latest release tag from GitHub API
             tag=$(curl -fsSL https://api.github.com/repos/darkhz/bluetuith/releases/latest \
                 2>/dev/null | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\(.*\)".*/\1/')
-            # strip leading v for filename
             local ver="${tag#v}"
             url="https://github.com/darkhz/bluetuith/releases/download/${tag}/bluetuith_${ver}_Linux_${arch}.tar.gz"
             tmp=$(mktemp -d)
@@ -101,25 +98,23 @@ install_deps() {
             fi
         fi
     fi
-#kmscon
-sudo systemctl disable getty@tty1 
-sudo systemctl enable kmscon.service 
-    # allow brightnessctl without sudo for current user
+
+    sudo systemctl disable getty@tty1
+    sudo systemctl enable kmscon.service
+
     if check_cmd brightnessctl; then
         local user="${SUDO_USER:-$USER}"
         if ! groups "$user" | grep -q video; then
-           usermod -aG input "$user" 2>/dev/null 
+           usermod -aG input "$user" 2>/dev/null
            usermod -aG video "$user" 2>/dev/null || \
                 warn "Could not add $user to video group — brightness may need sudo"
         fi
-        # setuid bit as fallback
         chmod u+s "$(command -v brightnessctl)" 2>/dev/null || true
     fi
 
     touch "$DEPS_FILE"
     ok "Setup complete; may need to install wifi drivers and networkmanager wifi plugin if not already installed."
 }
-
 
 
 # ─── audio helpers (PipeWire via wpctl) ───────────────────────────────────────
@@ -184,7 +179,6 @@ menu_audio() {
             "6" "Show sinks (wpctl)" \
             "b" "← Back" \
             3>&1 1>&2 2>&3) || return
-        # guard against empty or invalid choice
         [[ -z "$choice" || "$choice" == "-1" ]] && continue
         last="$choice"
 
@@ -197,7 +191,6 @@ menu_audio() {
                 local val
                 val=$(whiptail --inputbox "Enter volume (0-100):" 8 40 "$vol" \
                     --title "Set Volume" 3>&1 1>&2 2>&3) || continue
-                # validate it's a plain integer before passing to wpctl
                 if [[ "$val" =~ ^[0-9]+$ ]] && [[ "$val" -le 150 ]]; then
                     wpctl set-volume @DEFAULT_AUDIO_SINK@ "${val}%"
                 else
@@ -257,12 +250,9 @@ wifi_connect() {
     clear
     hdr "WiFi — scanning..."
 
-    # rescan (background, give it a moment)
     nmcli device wifi rescan 2>/dev/null &
     sleep 2
 
-    # build a pretty list: signal bars, SSID, security, known marker
-    # columns: IN-USE, BSSID, SSID, MODE, CHAN, RATE, SIGNAL, BARS, SECURITY
     local networks
     networks=$(nmcli -t -f IN-USE,SSID,SIGNAL,BARS,SECURITY device wifi list 2>/dev/null \
         | awk -F: '
@@ -283,7 +273,6 @@ wifi_connect() {
         return
     fi
 
-    # fzf picker — header row explains columns
     local selected
     selected=$(echo "$networks" \
         | fzf --ansi \
@@ -295,21 +284,14 @@ wifi_connect() {
               --bind="ctrl-r:+first" \
               --info=inline) || return
 
-    # extract SSID (field 2, trimmed)
     local ssid
-    ssid=$(echo "$selected" | awk '{$1=""; gsub(/^ +| +$/, ""); print $1}' \
-        | awk '{print $1}')
-    # simpler: grab col2 (after the ▶/ prefix)
     ssid=$(echo "$selected" | sed 's/^[▶ ]  //' | awk '{print $1}')
-
     [[ -z "$ssid" ]] && return
 
-    # check if we already have a saved connection for this SSID
     if nmcli connection show "$ssid" &>/dev/null; then
         ok "Connecting to saved network: $ssid"
         nmcli connection up "$ssid"
     else
-        # prompt for password if secured
         local sec
         sec=$(echo "$selected" | awk '{print $NF}')
         local pass=""
@@ -340,7 +322,6 @@ network_adapters() {
         clear
         hdr "Network Adapters"
 
-        # build adapter list with state, type, IP, MAC
         local lines=()
         while IFS= read -r iface; do
             [[ "$iface" == "lo" ]] && continue
@@ -348,7 +329,6 @@ network_adapters() {
             state=$(cat "/sys/class/net/${iface}/operstate" 2>/dev/null || echo "?")
             mac=$(cat "/sys/class/net/${iface}/address"    2>/dev/null || echo "?")
             ip=$(ip -4 -brief addr show "$iface" 2>/dev/null | awk '{print $3}')
-            # guess type from name / sys
             if [[ -d "/sys/class/net/${iface}/wireless" ]]; then
                 type_icon="wifi"
             elif [[ "$iface" == eth* || "$iface" == en* ]]; then
@@ -368,7 +348,6 @@ network_adapters() {
             read -rp "Press enter..."; return
         fi
 
-        # print table
         printf "  %-12s  %-4s  %-4s  %-18s  %s\n" "INTERFACE" "TYPE" "STATE" "IP" "MAC"
         printf "  %s\n" "$(printf '─%.0s' {1..60})"
         local fzf_input=""
@@ -380,7 +359,6 @@ network_adapters() {
         done
         echo
 
-        # fzf picker for actions
         local selected
         selected=$(echo "$fzf_input" \
             | fzf --prompt="Adapter > " \
@@ -431,7 +409,6 @@ network_adapters() {
 # ─── networking menu ──────────────────────────────────────────────────────────
 menu_network() {
     while true; do
-        # get current connection name + IP for status line
         local conn ip status_line
         conn=$(nmcli -t -f NAME,STATE connection show --active 2>/dev/null \
             | grep ":activated" | head -1 | cut -d: -f1)
@@ -555,7 +532,6 @@ menu_keydaemon() {
             1)
                 if $running; then
                     kill "$(cat "$KEY_DAEMON_PIDFILE")" 2>/dev/null || true
-                    # wait for process to actually die before removing pidfile
                     local pid
                     pid=$(cat "$KEY_DAEMON_PIDFILE" 2>/dev/null || true)
                     for _ in 1 2 3 4 5; do
@@ -565,13 +541,7 @@ menu_keydaemon() {
                     rm -f "$KEY_DAEMON_PIDFILE"
                     ok "Daemon stopped"
                 else
-                   # if [[ $EUID -ne 0 ]]; then
-                     #   warn "Starting daemon requires root. Running: sudo $0 --keys &"
-                    #    sudo "$0" --keys &
-                   # else
-                     "$0" --keys &
-                   # fi
-                    # wait for daemon to write its pidfile (up to 3s)
+                    "$0" --keys &
                     local waited=0
                     while [[ $waited -lt 10 ]]; do
                         sleep 0.3
@@ -581,7 +551,6 @@ menu_keydaemon() {
                     done
                     ok "Daemon started"
                 fi
-                # loop back — menu re-checks $running at top
                 ;;
             2)
                 clear; hdr "Key Daemon Log"
@@ -594,13 +563,7 @@ menu_keydaemon() {
 }
 
 # ─── hardware key daemon ──────────────────────────────────────────────────────
-# uses python3-evdev to listen on all input devices for key events
-# calls wpctl via the logged-in user's session bus
-
 run_key_daemon() {
-    #[[ $EUID -ne 0 ]] && { err "Key daemon must run as root (use sudo $0 --keys)"; exit 1; }
-
-    # ── guard: exit silently if already running ────────────────────────────────
     if [[ -f "$KEY_DAEMON_PIDFILE" ]]; then
         local _existing_pid
         _existing_pid=$(cat "$KEY_DAEMON_PIDFILE" 2>/dev/null)
@@ -608,47 +571,25 @@ run_key_daemon() {
             echo "[$(date)] Key daemon already running (pid ${_existing_pid}) — exiting" >> "$KEY_DAEMON_LOG"
             exit 0
         fi
-        # stale pidfile — remove it and continue
         rm -f "$KEY_DAEMON_PIDFILE"
     fi
 
     echo $$ > "$KEY_DAEMON_PIDFILE"
     echo "[$(date)] Key daemon started (pid $$)" >> "$KEY_DAEMON_LOG"
 
-    # find the user running a display/tty session to run wpctl under their bus
-    get_session_user() {
-        # prefer loginctl active session
-        loginctl list-sessions --no-legend 2>/dev/null \
-            | awk '$3 != "root" {print $3; exit}' \
-            || echo "${SUDO_USER:-}"
-    }
+    python3 - <<'PYEOF' "$VOLUME_STEP" "$BRIGHTNESS_STEP" "$KEY_DAEMON_LOG" "$TMUX_SESSION"
+import sys, subprocess, os, time, glob, threading
 
-    # run a command as the session user with their dbus/pipewire env
-    as_user() {
-        local user="$1"; shift
-        local uid
-        uid=$(id -u "$user" 2>/dev/null) || return 1
-        local bus="/run/user/${uid}/bus"
-        sudo -u "$user" DBUS_SESSION_BUS_ADDRESS="unix:path=${bus}" \
-            XDG_RUNTIME_DIR="/run/user/${uid}" "$@"
-    }
-
-    # write the python listener inline
-    python3 - <<'PYEOF' "$VOLUME_STEP" "$BRIGHTNESS_STEP" "$KEY_DAEMON_LOG"
-import sys, subprocess, os, time, glob, signal, threading
-
-vol_step   = sys.argv[1]  # e.g. "5"
-bri_step   = sys.argv[2]
-log_file   = sys.argv[3]
-
-TMUX_SESSION = "workspaces"
-MAX_WORKSPACES = 16
+vol_step     = sys.argv[1]
+bri_step     = sys.argv[2]
+log_file     = sys.argv[3]
+tmux_session = sys.argv[4]
 
 try:
     import evdev
     from evdev import InputDevice, categorize, ecodes
 except ImportError:
-    print("python3-evdev not installed — run the script without --keys first to install deps", flush=True)
+    print("python3-evdev not installed", flush=True)
     sys.exit(1)
 
 def log(msg):
@@ -664,9 +605,7 @@ def log(msg):
 def get_session_user():
     try:
         out = subprocess.check_output(
-            ["loginctl", "list-sessions", "--no-legend"],
-            text=True
-        )
+            ["loginctl", "list-sessions", "--no-legend"], text=True)
         for line in out.splitlines():
             parts = line.split()
             if len(parts) >= 3 and parts[2] != "root":
@@ -678,7 +617,6 @@ def get_session_user():
 def as_user(*cmd):
     user = get_session_user()
     if not user:
-        log(f"no session user found, running as root")
         return subprocess.run(list(cmd), capture_output=True)
     try:
         uid = int(subprocess.check_output(["id", "-u", user], text=True).strip())
@@ -688,8 +626,7 @@ def as_user(*cmd):
     if uid:
         env["XDG_RUNTIME_DIR"] = f"/run/user/{uid}"
         env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path=/run/user/{uid}/bus"
-    return subprocess.run(["sudo", "-u", user] + list(cmd),
-                          env=env, capture_output=True)
+    return subprocess.run(["sudo", "-u", user] + list(cmd), env=env, capture_output=True)
 
 def vol_up():
     as_user("wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{vol_step}%+")
@@ -715,44 +652,10 @@ def bri_down():
     subprocess.run(["brightnessctl", "set", f"{bri_step}%-", "-q"])
     log("brightness down")
 
-# ── workspace switching ────────────────────────────────────────────────────────
-# chord state: did we just see Ctrl+W?
-_ctrl_w_armed = False
-_ctrl_w_timer = None
-_ctrl_w_lock  = threading.Lock()
-
-def _disarm():
-    global _ctrl_w_armed
-    with _ctrl_w_lock:
-        _ctrl_w_armed = False
-
-def _arm_ctrl_w():
-    global _ctrl_w_armed, _ctrl_w_timer
-    with _ctrl_w_lock:
-        _ctrl_w_armed = True
-        if _ctrl_w_timer:
-            _ctrl_w_timer.cancel()
-        # auto-disarm after 1.5s if no follow-up key
-        _ctrl_w_timer = threading.Timer(1.5, _disarm)
-        _ctrl_w_timer.start()
-    log("Ctrl+W armed — waiting for workspace number")
-
-def _key_to_ws(code):
-    """Return workspace number 1-16 from a key code, or None."""
-    from evdev import ecodes as e
-    mapping = {
-        e.KEY_1: 1,  e.KEY_2: 2,  e.KEY_3: 3,  e.KEY_4: 4,
-        e.KEY_5: 5,  e.KEY_6: 6,  e.KEY_7: 7,  e.KEY_8: 8,
-        e.KEY_9: 9,  e.KEY_0: 10,
-        e.KEY_A: 11, e.KEY_B: 12, e.KEY_C: 13,
-        e.KEY_D: 14, e.KEY_E: 15, e.KEY_F: 16,
-    }
-    return mapping.get(code)
-
+# ── tmux workspace switching (Meta + 1-4) ─────────────────────────────────────
 def ws_switch(num):
-    """Switch to tmux workspace number, creating it if needed."""
+    """Switch to tmux window number (1-4)."""
     try:
-        # find tmux socket — daemon runs as root but tmux session belongs to the user
         user = get_session_user()
         uid = None
         if user:
@@ -761,106 +664,58 @@ def ws_switch(num):
             except Exception:
                 pass
 
-        def tmux_cmd(*args):
-            """Run a tmux command, injecting TMUX_TMPDIR so root can reach the user's socket."""
-            env = os.environ.copy()
-            if uid:
-                # tmux default socket lives in /tmp/tmux-<uid>/default
-                env["TMUX_TMPDIR"] = f"/tmp/tmux-{uid}"
-            return subprocess.run(["tmux"] + list(args), capture_output=True, text=True, env=env)
+        env = os.environ.copy()
+        if uid:
+            env["TMUX_TMPDIR"] = f"/tmp/tmux-{uid}"
+
+        def tmux(*args):
+            return subprocess.run(["tmux"] + list(args),
+                                   capture_output=True, text=True, env=env)
 
         def tmux_out(*args):
-            env = os.environ.copy()
-            if uid:
-                env["TMUX_TMPDIR"] = f"/tmp/tmux-{uid}"
             return subprocess.check_output(["tmux"] + list(args), text=True, env=env)
 
-        # check session exists
-        r = tmux_cmd("has-session", "-t", TMUX_SESSION)
+        # session must exist (started by bashrc snippet on login)
+        r = tmux("has-session", "-t", tmux_session)
         if r.returncode != 0:
-            log(f"workspace session '{TMUX_SESSION}' not found (uid={uid}) — is workspace.sh running?")
+            log(f"tmux session '{tmux_session}' not found — is it running?")
             return
 
-        # check if window exists
-        existing = tmux_out("list-windows", "-t", TMUX_SESSION, "-F", "#{window_index}").split()
+        existing = tmux_out("list-windows", "-t", tmux_session,
+                            "-F", "#{window_index}").split()
 
         if str(num) not in existing:
-            total = len(existing)
-            if total >= MAX_WORKSPACES:
-                log(f"max workspaces reached, cannot create ws{num}")
-                return
-            tmux_cmd("new-window", "-t", f"{TMUX_SESSION}:{num}", "-n", f"ws{num}")
+            tmux("new-window", "-t", f"{tmux_session}:{num}", "-n", f"ws{num}")
             log(f"created workspace {num}")
 
-        tmux_cmd("select-window", "-t", f"{TMUX_SESSION}:{num}")
+        tmux("select-window", "-t", f"{tmux_session}:{num}")
         log(f"switched to workspace {num}")
-
-        # ensure spare in background
-        threading.Thread(target=lambda: _ensure_spare(tmux_cmd, tmux_out), daemon=True).start()
 
     except Exception as ex:
         log(f"ws_switch error: {ex}")
 
-def _ensure_spare(tmux_cmd, tmux_out):
-    """Keep at least one idle workspace pre-created."""
-    try:
-        existing = tmux_out("list-windows", "-t", TMUX_SESSION, "-F", "#{window_index}").split()
-        total = len(existing)
-        if total >= MAX_WORKSPACES:
-            return
-        # count idle (no child processes)
-        idle = 0
-        for idx in existing:
-            try:
-                pane_pid = subprocess.check_output(
-                    ["tmux", "display-message", "-t", f"{TMUX_SESSION}:{idx}",
-                     "-p", "#{pane_pid}"],
-                    text=True
-                ).strip()
-                children = subprocess.run(
-                    ["pgrep", "-P", pane_pid],
-                    capture_output=True, text=True
-                ).stdout.strip()
-                if not children:
-                    idle += 1
-            except Exception:
-                pass
-        if idle < 1:
-            # find next free index
-            used = set(int(x) for x in existing)
-            for i in range(1, MAX_WORKSPACES + 1):
-                if i not in used:
-                    tmux_cmd("new-window", "-t", f"{TMUX_SESSION}:{i}", "-n", f"ws{i}")
-                    log(f"pre-created spare workspace {i}")
-                    break
-    except Exception as ex:
-        log(f"ensure_spare error: {ex}")
-
-# key code → action (for direct keys)
+# ── key maps ──────────────────────────────────────────────────────────────────
 KEY_MAP = {
-    ecodes.KEY_VOLUMEUP:         vol_up,
-    ecodes.KEY_VOLUMEDOWN:       vol_down,
-    ecodes.KEY_MUTE:             vol_mute,
-    ecodes.KEY_MICMUTE:          mic_mute,
-    ecodes.KEY_BRIGHTNESSUP:     bri_up,
-    ecodes.KEY_BRIGHTNESSDOWN:   bri_down,
+    ecodes.KEY_VOLUMEUP:     vol_up,
+    ecodes.KEY_VOLUMEDOWN:   vol_down,
+    ecodes.KEY_MUTE:         vol_mute,
+    ecodes.KEY_MICMUTE:      mic_mute,
+    ecodes.KEY_BRIGHTNESSUP: bri_up,
+    ecodes.KEY_BRIGHTNESSDOWN: bri_down,
 }
 
-# keys that matter for workspace chord (Ctrl+W then number/letter)
-WS_TRIGGER = ecodes.KEY_W
-WS_TARGETS = {
-    ecodes.KEY_1, ecodes.KEY_2, ecodes.KEY_3, ecodes.KEY_4,
-    ecodes.KEY_5, ecodes.KEY_6, ecodes.KEY_7, ecodes.KEY_8,
-    ecodes.KEY_9, ecodes.KEY_0,
-    ecodes.KEY_A, ecodes.KEY_B, ecodes.KEY_C,
-    ecodes.KEY_D, ecodes.KEY_E, ecodes.KEY_F,
+# Meta (Alt) + 1-4 workspace keys
+WS_KEYS = {
+    ecodes.KEY_1: 1,
+    ecodes.KEY_2: 2,
+    ecodes.KEY_3: 3,
+    ecodes.KEY_4: 4,
 }
 
 def find_key_devices():
     devs = []
-    # build full set of codes we care about
-    all_codes = set(KEY_MAP.keys()) | {WS_TRIGGER} | WS_TARGETS | \
-                {ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL}
+    all_codes = (set(KEY_MAP.keys()) | set(WS_KEYS.keys()) |
+                 {ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT})
     for path in glob.glob("/dev/input/event*"):
         try:
             d = InputDevice(path)
@@ -880,38 +735,28 @@ if not devices:
 
 import asyncio
 
-# track ctrl held state
-_ctrl_held = False
+_alt_held = False
 
 async def read_device(dev):
-    global _ctrl_w_armed, _ctrl_held
+    global _alt_held
     async for event in dev.async_read_loop():
         if event.type != ecodes.EV_KEY:
             continue
         key = categorize(event)
 
-        # track ctrl
-        if event.code in (ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL):
-            _ctrl_held = (key.keystate != key.key_up)
+        # track Alt (Meta) held state
+        if event.code in (ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT):
+            _alt_held = (key.keystate != key.key_up)
             continue
 
         if key.keystate == key.key_down:
-            # Ctrl+W arms the chord
-            if event.code == WS_TRIGGER and _ctrl_held:
-                _arm_ctrl_w()
+            # Meta + 1-4 → workspace switch
+            if _alt_held and event.code in WS_KEYS:
+                num = WS_KEYS[event.code]
+                threading.Thread(target=ws_switch, args=(num,), daemon=True).start()
                 continue
 
-            # if armed, next number/letter = workspace switch
-            with _ctrl_w_lock:
-                armed = _ctrl_w_armed
-            if armed and event.code in WS_TARGETS:
-                _disarm()
-                ws_num = _key_to_ws(event.code)
-                if ws_num:
-                    threading.Thread(target=ws_switch, args=(ws_num,), daemon=True).start()
-                continue
-
-            # regular mapped key
+            # regular mapped keys (media keys etc.)
             action = KEY_MAP.get(event.code)
             if action:
                 try:
@@ -927,8 +772,6 @@ PYEOF
 }
 
 # ─── prompt setup ─────────────────────────────────────────────────────────────
-# writes a PS1 to ~/.bashrc showing:  user@host : [bat%] : [HH:MM]
-#                                     $
 setup_prompt() {
     local target_user="${SUDO_USER:-$USER}"
     local bashrc
@@ -940,8 +783,6 @@ setup_prompt() {
         return
     fi
 
-    # the PS1 function reads battery inline each prompt
-    # uses \[ \] around non-printing sequences to keep readline happy
     cat >> "$bashrc" <<'PROMPT'
 
 # sysctl-prompt — managed by sysctl.sh, remove this block to revert
@@ -984,7 +825,6 @@ PROMPT
 
 # ─── yes/no prompt helper ─────────────────────────────────────────────────────
 _ask_yn() {
-    # usage: _ask_yn "Question text" [default: y|n]
     local prompt="$1"
     local default="${2:-y}"
     local hint
@@ -1040,16 +880,13 @@ _motd_net() {
     fi
 }
 
-
-
 R='\033[0m'; BD='\033[1m'; DIM='\033[2m'
-C1='\033[38;5;39m'   # sky blue
-C2='\033[38;5;87m'   # cyan
-C3='\033[38;5;245m'  # grey
-CG='\033[38;5;83m'   # green
-CY='\033[38;5;228m'  # yellow
+C1='\033[38;5;39m'
+C2='\033[38;5;87m'
+C3='\033[38;5;245m'
+CG='\033[38;5;83m'
+CY='\033[38;5;228m'
 
-# ── banner ────────────────────────────────────────────────────────────────────
 echo -e "${C1}${BD}"
 echo '  ████████╗████████╗██╗   ██╗██╗  ██╗██╗████████╗'
 echo '     ██╔══╝╚══██╔══╝╚██╗ ██╔╝██║ ██╔╝██║╚══██╔══╝'
@@ -1059,7 +896,6 @@ echo '     ██║      ██║      ██║   ██║  ██╗██�
 echo '     ╚═╝      ╚═╝      ╚═╝   ╚═╝  ╚═╝╚═╝   ╚═╝   '
 echo -e "${R}"
 
-# ── stats ─────────────────────────────────────────────────────────────────────
 local_ip=$(_motd_net)
 bat_info=$(_motd_bat)
 uptime_str=$(uptime -p 2>/dev/null | sed 's/up //')
@@ -1077,7 +913,7 @@ echo -e "  ${C3}├────────────────────�
 printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}${R}\n"      "network"  "$local_ip"
 printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}${R}\n"      "battery"  "$bat_info"
 echo -e "  ${C3}└──────────────────────────────────────────┘${R}"
-echo -e "  ${DIM}ttykit           system controls${R}"
+echo -e "  ${DIM}ttykit  •  Meta+1-4 to switch workspaces${R}"
 MOTD_SCRIPT
 
     chmod +x "$motd_script"
@@ -1092,52 +928,43 @@ ${marker}
 # ttykit-motd-end
 BASHRC
         ok "MOTD installed → ${motd_script}"
-        echo "  Will show on every new login shell"
     else
         warn "MOTD already configured in $bashrc — skipping"
     fi
 }
 
 # ─── ttykit self-install ──────────────────────────────────────────────────────
-# Copies sysctl.sh to ~/.local/bin/.ttykit-bin/sysctl.sh and creates a symlink
-# at ~/.local/bin/ttykit pointing to it.  Also wires the key daemon into .bashrc.
 setup_ttykit() {
     local target_user="${SUDO_USER:-$USER}"
     local home
     home=$(eval echo "~${target_user}")
     local bin_dir="${home}/.local/bin"
-    # Store the actual script in a dot-prefixed subdir so its name never
-    # collides with the ~/.local/bin/ttykit symlink we create alongside it.
     local kit_dir="${bin_dir}/.ttykit-bin"
     local script_dst="${kit_dir}/sysctl.sh"
     local symlink_dst="${bin_dir}/ttykit"
 
-    # resolve the actual path of the currently running script
     local script_src
     script_src=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}")
 
     mkdir -p "$kit_dir"
     chown "${target_user}:${target_user}" "$kit_dir" 2>/dev/null || true
 
-    # copy the script into the kit dir
     install -m 755 "$script_src" "$script_dst"
     chown "${target_user}:${target_user}" "$script_dst" 2>/dev/null || true
     ok "Installed → ${script_dst}"
 
-    # create / update the ~/.local/bin/ttykit symlink
-    # If a real directory exists there we cannot overwrite it with ln — warn and bail.
     if [[ -d "$symlink_dst" && ! -L "$symlink_dst" ]]; then
         warn "Cannot create symlink at ${symlink_dst} — a real directory exists there."
-        warn "Remove it manually first: rm -rf ${symlink_dst}"
         return 1
     fi
-    rm -f "$symlink_dst"   # remove stale symlink or stale file
+    rm -f "$symlink_dst"
     ln -sf "$script_dst" "$symlink_dst"
     chown -h "${target_user}:${target_user}" "$symlink_dst" 2>/dev/null || true
     ok "Symlink → ${symlink_dst} → ${script_dst}"
 
-    # ensure ~/.local/bin is on PATH in .bashrc
     local bashrc="${home}/.bashrc"
+
+    # PATH
     local path_marker="# ttykit-path"
     if ! grep -q "$path_marker" "$bashrc" 2>/dev/null; then
         cat >> "$bashrc" <<BASHRC
@@ -1149,13 +976,9 @@ BASHRC
         ok "Added ~/.local/bin to PATH in ${bashrc}"
     fi
 
-    # wire the key daemon autostart into .bashrc
+    # key daemon autostart
     local daemon_marker="# ttykit-keydaemon"
     if ! grep -q "$daemon_marker" "$bashrc" 2>/dev/null; then
-        # Use printf to avoid heredoc variable-expansion and nested-quote issues.
-        # $script_dst and $KEY_DAEMON_PIDFILE are expanded NOW (correct — we want
-        # the installed path baked in); $() and $? must be literal in the shell
-        # code we're writing, so they are escaped.
         printf '\n%s\n' "$daemon_marker" >> "$bashrc"
         printf '# Auto-start hardware key daemon (only if not already running)\n' >> "$bashrc"
         printf 'if [[ -f "%s" ]] && kill -0 "$(cat "%s" 2>/dev/null)" 2>/dev/null; then\n' \
@@ -1171,6 +994,69 @@ BASHRC
     fi
 }
 
+# ─── tmux workspace bashrc snippet ───────────────────────────────────────────
+setup_tmux_workspaces() {
+    local target_user="${SUDO_USER:-$USER}"
+    local home
+    home=$(eval echo "~${target_user}")
+    local bashrc="${home}/.bashrc"
+    local marker="# ttykit-tmux-workspaces"
+
+    if grep -q "$marker" "$bashrc" 2>/dev/null; then
+        warn "tmux workspace autostart already in ${bashrc} — skipping"
+        return
+    fi
+
+    # Write a self-contained snippet that:
+    #  1. starts the tmux session if it doesn't exist
+    #  2. creates windows 1-4 that are missing
+    #  3. attaches if this shell is not already inside tmux
+    cat >> "$bashrc" <<BASHRC
+
+${marker}
+# Start tmux 'workspaces' session with 4 windows on login (idempotent)
+_ttykit_tmux_init() {
+    local session="${TMUX_SESSION}"
+    local n=${NUM_WORKSPACES}
+    if ! tmux has-session -t "\$session" 2>/dev/null; then
+        tmux new-session -d -s "\$session" -n "ws1"
+        # minimal status bar — just window numbers centred
+        tmux set-option -t "\$session" status on
+        tmux set-option -t "\$session" status-position bottom
+        tmux set-option -t "\$session" status-style "bg=black,fg=colour240"
+        tmux set-option -t "\$session" status-left ""
+        tmux set-option -t "\$session" status-right ""
+        tmux set-option -t "\$session" status-justify centre
+        tmux set-option -t "\$session" window-status-format "#[fg=colour240] #{window_index} "
+        tmux set-option -t "\$session" window-status-current-format "#[fg=colour255,bold,bg=colour236] #{window_index} "
+        tmux set-option -t "\$session" window-status-separator ""
+        tmux set-option -t "\$session" prefix None
+        tmux set-option -t "\$session" prefix2 None
+        tmux unbind-key  -a -T prefix 2>/dev/null || true
+        tmux set-option -t "\$session" bell-action none
+        tmux set-option -t "\$session" visual-bell off
+    fi
+    # ensure windows 1-\$n exist
+    local i
+    for i in \$(seq 2 \$n); do
+        if ! tmux list-windows -t "\$session" -F "#{window_index}" 2>/dev/null | grep -qx "\$i"; then
+            tmux new-window -t "\$session:\$i" -n "ws\$i"
+        fi
+    done
+    # attach only when this is a login shell and we're not already inside tmux
+    if [[ -z "\${TMUX:-}" ]]; then
+        exec tmux attach-session -t "\$session"
+    fi
+}
+_ttykit_tmux_init
+# ttykit-tmux-workspaces-end
+BASHRC
+
+    ok "tmux workspace autostart added to ${bashrc}"
+    echo "  On next login: session '${TMUX_SESSION}' will be created with ${NUM_WORKSPACES} windows."
+    echo "  Switch with Meta+1, Meta+2, Meta+3, Meta+4 (handled by the key daemon)."
+}
+
 # ─── first-run ────────────────────────────────────────────────────────────────
 first_run() {
     [[ $EUID -ne 0 ]] && { err "Run --firstrun with sudo"; exit 1; }
@@ -1182,7 +1068,7 @@ first_run() {
     echo
 
     # ── step 1: packages ────────────────────────────────────────────────────
-    echo -e "${BOLD}Step 1/4 — System packages${RESET}"
+    echo -e "${BOLD}Step 1/5 — System packages${RESET}"
     echo "  Will install: brightnessctl alsa-utils wireplumber pipewire-utils"
     echo "                NetworkManager fzf python3 tmux python3-evdev newt"
     echo "                pipewire-pulse  + bluetuith from GitHub"
@@ -1195,14 +1081,13 @@ first_run() {
     echo
 
     # ── step 2: ttykit self-install ─────────────────────────────────────────
-    echo -e "${BOLD}Step 2/4 — Install / update ttykit${RESET}"
+    echo -e "${BOLD}Step 2/5 — Install / update ttykit${RESET}"
     local target_user="${SUDO_USER:-$USER}"
     local home; home=$(eval echo "~${target_user}")
     local kit_dir="${home}/.local/bin/.ttykit-bin"
     local script_dst="${kit_dir}/sysctl.sh"
     if [[ -f "$script_dst" ]]; then
         echo "  ttykit is already installed at ${script_dst}."
-        echo "  Choosing 'yes' will overwrite it with this version."
         if _ask_yn "Overwrite / update ttykit?"; then
             setup_ttykit
         else
@@ -1221,8 +1106,21 @@ first_run() {
     fi
     echo
 
-    # ── step 3: prompt ──────────────────────────────────────────────────────
-    echo -e "${BOLD}Step 3/4 — Custom bash prompt${RESET}"
+    # ── step 3: tmux workspaces ─────────────────────────────────────────────
+    echo -e "${BOLD}Step 3/5 — tmux workspace autostart${RESET}"
+    echo "  Adds a ~/.bashrc snippet that starts a tmux session with"
+    echo "  ${NUM_WORKSPACES} workspaces on login (idempotent — safe to re-run)."
+    echo "  Switch with Meta+1 … Meta+${NUM_WORKSPACES} via the key daemon."
+    echo
+    if _ask_yn "Add tmux workspace autostart to ~/.bashrc?"; then
+        setup_tmux_workspaces
+    else
+        warn "Skipping tmux workspace setup"
+    fi
+    echo
+
+    # ── step 4: prompt ──────────────────────────────────────────────────────
+    echo -e "${BOLD}Step 4/5 — Custom bash prompt${RESET}"
     echo "  Adds a prompt showing:  user@host : battery% : HH:MM : cwd"
     echo
     if _ask_yn "Set up custom bash prompt?"; then
@@ -1232,9 +1130,9 @@ first_run() {
     fi
     echo
 
-    # ── step 4: motd ────────────────────────────────────────────────────────
-    echo -e "${BOLD}Step 4/4 — Login MOTD${RESET}"
-    echo "  Adds a status banner (host, time, battery, network, workspaces)"
+    # ── step 5: motd ────────────────────────────────────────────────────────
+    echo -e "${BOLD}Step 5/5 — Login MOTD${RESET}"
+    echo "  Adds a status banner (host, time, battery, network)"
     echo "  shown every time you open a new terminal."
     echo
     if _ask_yn "Install MOTD?"; then
@@ -1265,7 +1163,6 @@ info_bat() {
         power_now=$(cat "$bat_dir/current_now" 2>/dev/null \
                  || cat "$bat_dir/power_now"   2>/dev/null || echo "")
 
-        # estimate time remaining
         if [[ -n "$capacity_now" && -n "$power_now" && "$power_now" -gt 0 ]] 2>/dev/null; then
             local mins
             case "$status" in
@@ -1281,7 +1178,6 @@ info_bat() {
             esac
         fi
 
-        # draw a little bar
         local bar_len=20 filled
         filled=$(( pct * bar_len / 100 ))
         local bar=""
@@ -1301,7 +1197,6 @@ info_audio() {
     local vol mute sink_name
     vol=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null | awk '{printf "%d", $2*100}')
     mute=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null | grep -q MUTED && echo "MUTED" || echo "unmuted")
-    # get sink description (friendly name)
     sink_name=$(wpctl inspect @DEFAULT_AUDIO_SINK@ 2>/dev/null \
         | grep -i "node.description\|node.nick\|media.name" \
         | head -1 | sed 's/.*= "\(.*\)"/\1/')
@@ -1311,7 +1206,6 @@ info_audio() {
     mic_mute=$(wpctl get-volume @DEFAULT_AUDIO_SOURCE@ 2>/dev/null \
         | grep -q MUTED && echo "MUTED" || echo "unmuted")
 
-    # volume bar
     local bar_len=20 filled
     filled=$(( vol * bar_len / 100 ))
     local bar=""
@@ -1327,7 +1221,6 @@ info_audio() {
 
 info_net() {
     hdr "Network"
-    # active connections
     local conns
     conns=$(nmcli -t -f NAME,TYPE,DEVICE,STATE connection show --active 2>/dev/null \
         | grep ":activated")
@@ -1345,7 +1238,6 @@ info_net() {
         done <<< "$conns"
     fi
 
-    # wifi signal if applicable
     local wifi_info
     wifi_info=$(nmcli -t -f ACTIVE,SSID,SIGNAL,BARS device wifi list 2>/dev/null \
         | grep "^yes:" | head -1)
@@ -1403,7 +1295,6 @@ info_all() {
     info_net
     info_bt
 }
-
 
 main_menu() {
     while true; do
