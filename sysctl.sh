@@ -101,7 +101,11 @@ install_deps() {
 
     sudo systemctl disable getty@tty1
     sudo systemctl enable kmscon.service
-
+    mkdir -p /etc/udev/rules.d/
+    sudo echo 'KERNEL=="uinput", MODE="0660", GROUP="input"' > /etc/udev/rules.d/99-uinput.rules
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger
+    
     if check_cmd brightnessctl; then
         local user="${SUDO_USER:-$USER}"
         if ! groups "$user" | grep -q video; then
@@ -988,7 +992,7 @@ BASHRC
             "$KEY_DAEMON_PIDFILE" "$KEY_DAEMON_PIDFILE" >> "$bashrc"
         printf '    : # already running\n' >> "$bashrc"
         printf 'else\n' >> "$bashrc"
-        printf '    "exec %s" --keys &>/dev/null \n' "$script_dst" >> "$bashrc"
+        printf '    "exec %s" --keys &>/dev/null &\n' "$script_dst" >> "$bashrc"
         printf 'fi\n' >> "$bashrc"
         printf '# ttykit-keydaemon-end\n' >> "$bashrc"
         ok "Key daemon autostart added to ${bashrc}"
