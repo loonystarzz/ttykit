@@ -24,7 +24,7 @@ TMUX_SESSION="workspaces"
 NUM_WORKSPACES=4
 KEYD_CONF="/etc/keyd/default.conf"
 
-echo "running as user" $(whoami) "(has to be ur current user!!)"
+echo "running as user" $SUDO_USER "(has to be ur current user!!)"
 # ─── colour helpers ────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
@@ -192,20 +192,14 @@ install_keyd() {
 
 write_keyd_conf() {
     mkdir -p /etc/keyd
-
-    # build tmux switch commands for each workspace
-    local ws_bindings=""
-    for i in $(seq 1 "$NUM_WORKSPACES"); do
-        ws_bindings+="meta.${i} = command(tmux select-window -t ${TMUX_SESSION}:${i})"$'\n'
-    done
-
     cat > "$KEYD_CONF" <<EOF
 [ids]
 *
 
 [main]
-# workspace switching — Meta+1 through Meta+${NUM_WORKSPACES}
-${ws_bindings}
+# workspace switching — forward/back  next/previous window
+back    = command(sudo -u ${SUDO_USER} tmux previous-window)
+forward = command(sudo -u ${SUDO_USER} tmux next-window)
 # volume
 volumeup   = command(su ${SUDO_USER} -c 'amixer set Master ${VOLUME_STEP}%+')
 volumedown = command(su ${SUDO_USER} -c 'amixer set Master ${VOLUME_STEP}%-')
@@ -757,7 +751,7 @@ echo -e "  ${C3}├────────────────────�
 printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}${R}\n"      "network" "$local_ip"
 printf  "  ${C3}│${R}  ${BD}%-14s${R}  %-26s${C3}${R}\n"      "battery" "$bat_info"
 echo -e "  ${C3}└──────────────────────────────────────────┘${R}"
-echo -e "  ${DIM}ttykit  •  Meta+1-4 to switch workspaces${R}"
+echo -e "  ${DIM}ttykit  •  Forward ->/ Back <- to switch workspaces${R}"
 MOTD_SCRIPT
 
     chmod +x "$motd_script"
