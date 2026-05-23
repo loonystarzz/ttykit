@@ -197,13 +197,15 @@ write_keyd_conf() {
 *
 
 [main]
+# screeeenshot
+zoom = command(DISPLAY=:0 XAUTHORITY=/home/${SUDO_USER}/.Xauthority sudo -u ${SUDO_USER} scrot ~/Pictures/Screenshots/%F-%H-%M-%S.png)
 # workspace switching — forward/back  next/previous window
 back    = command(sudo -u ${SUDO_USER} tmux previous-window)
 forward = command(sudo -u ${SUDO_USER} tmux next-window)
 # volume
-volumeup   = command(su ${SUDO_USER} -c 'amixer set Master ${VOLUME_STEP}%+')
-volumedown = command(su ${SUDO_USER} -c 'amixer set Master ${VOLUME_STEP}%-')
-mute       = command(su ${SUDO_USER} -c 'amixer set Master toggle')
+volumeup   = command(su ${SUDO_USER} -c 'wpctl set-volume @DEFAULT_AUDIO_SINK@ "${VOLUME_STEP}%+"')
+volumedown = command(su ${SUDO_USER} -c 'wpctl set-volume @DEFAULT_AUDIO_SINK@ "${VOLUME_STEP}%-"')
+mute       = command(su ${SUDO_USER} -c 'wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle')
 
 # brightness
 brightnessup   = command(brightnessctl set ${BRIGHTNESS_STEP}%+)
