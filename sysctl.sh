@@ -51,6 +51,7 @@ install_deps() {
     check_cmd tmux          || pkgs+=(tmux)
     check_cmd whiptail      || pkgs+=(newt)
     check_cmd pactl         || pkgs+=(pipewire-pulse)
+    check_cmd xfce4-screenshooter || pkgs+=(xfce4-screenshooter)
                                pkgs+=(google-noto-emoji-fonts)
     if [[ ${#pkgs[@]} -gt 0 ]]; then
         echo "Installing: ${pkgs[*]}"
@@ -147,10 +148,11 @@ setup_startx_bashrc() {
     cat >> "$bashrc" <<'BASHRC'
 
 # ttykit-startx
-# start X automatically when logging in on a TTY (not inside tmux/screen/SSH)
+# start X automatically when logging in on a TTY (not inside tmux/screen/SSH) + add alias for screenshot
 if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" && "$(tty)" == /dev/tty* && -z "${TMUX:-}" && -z "${STY:-}" && -z "${SSH_CONNECTION:-}" ]]; then
     exec startx
 fi
+alias screenshot=xfce4-screenshooter
 # ttykit-startx-end
 BASHRC
 
@@ -197,8 +199,6 @@ write_keyd_conf() {
 *
 
 [main]
-# screeeenshot
-zoom = command(DISPLAY=:0 XAUTHORITY=/home/${SUDO_USER}/.Xauthority sudo -u ${SUDO_USER} scrot ~/Pictures/Screenshots/%F-%H-%M-%S.png)
 # workspace switching — forward/back  next/previous window
 back    = command(sudo -u ${SUDO_USER} tmux previous-window)
 forward = command(sudo -u ${SUDO_USER} tmux next-window)
