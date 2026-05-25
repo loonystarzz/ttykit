@@ -51,7 +51,7 @@ install_deps() {
     check_cmd tmux          || pkgs+=(tmux)
     check_cmd whiptail      || pkgs+=(newt)
     check_cmd pactl         || pkgs+=(pipewire-pulse)
-
+                               pkgs+=(google-noto-emoji-fonts)
     if [[ ${#pkgs[@]} -gt 0 ]]; then
         echo "Installing: ${pkgs[*]}"
         dnf install -y "${pkgs[@]}"
