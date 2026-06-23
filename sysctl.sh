@@ -13,6 +13,7 @@
 #   ./sysctl.sh net               → active connection + IP
 #   ./sysctl.sh bt                → bluetooth status + connected devices
 #   ./sysctl.sh bri               → screen brightness
+#   ./sysctl.sh drives            → storage / mount overview
 #   ./sysctl.sh all               → everything at once
 
 set -euo pipefail
@@ -1079,18 +1080,369 @@ info_bri() {
 
 info_all() { info_bat; info_audio; info_bri; info_net; info_bt; }
 
+# ─── drive / mount helpers ────────────────────────────────────────────────────
+
+# List block devices with key info (name, size, type, label, mountpoint, fstype)
+_drives_list() {
+    lsblk -o NAME,SIZE,TYPE,LABEL,MOUNTPOINT,FSTYPE -J 2>/dev/null \
+        | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+rows = []
+def walk(devs, depth=0):
+    for d in devs or []:
+        indent = '  ' * depth
+        name  = d.get('name','')
+        size  = d.get('size','?')
+        dtype = d.get('type','?')
+        label = d.get('label') or ''
+        mp    = d.get('mountpoint') or ''
+        fs    = d.get('fstype') or ''
+        rows.append((name, size, dtype, label, mp, fs))
+        walk(d.get('children'), depth+1)
+walk(data.get('blockdevices',[]))
+for r in rows:
+    print('\t'.join(r))
+" 2>/dev/null
+}
+
+# Pretty table for whiptail / fzf display
+_drives_table() {
+    _drives_list | awk -F'\t' '{
+        printf "%-12s  %-6s  %-5s  %-12s  %-16s  %s\n",
+            $1, $2, $3, $4, $5, $6
+    }'
+}
+
+# Return mountpoint of a device name (e.g. sda1)
+_mount_of() { lsblk -no MOUNTPOINT "/dev/$1" 2>/dev/null | head -1; }
+
+# Pick a device interactively with fzf; echoes device name or empty
+_drive_pick() {
+    local header="${1:-Enter=select  Esc=back}"
+    local sel
+    sel=$( { printf "%-12s  %-6s  %-5s  %-12s  %-16s  %s\n" \
+                "DEVICE" "SIZE" "TYPE" "LABEL" "MOUNTPOINT" "FSTYPE"
+              _drives_table; } \
+        | fzf --prompt="Drive > " \
+              --header="$header" \
+              --height=60% \
+              --border=rounded \
+              --ansi) || return 1
+    echo "$sel" | awk '{print $1}'
+}
+
+# ── info panel ──────────────────────────────────────────────────────────────
+drives_info() {
+    clear
+    hdr "Block Devices & Mount Points"
+    printf "  %-12s  %-6s  %-5s  %-12s  %-16s  %s\n" \
+        "DEVICE" "SIZE" "TYPE" "LABEL" "MOUNTPOINT" "FSTYPE"
+    printf "  %s\n" "$(printf '─%.0s' {1..70})"
+    _drives_table | while IFS= read -r line; do echo "  $line"; done
+    echo
+    hdr "Disk Usage (df -h)"
+    df -h --output=source,size,used,avail,pcent,target 2>/dev/null \
+        | grep -v tmpfs | grep -v devtmpfs | grep -v udev
+    echo
+    read -rp "Press enter to continue..."
+}
+
+# ── mount a device ──────────────────────────────────────────────────────────
+drives_mount() {
+    clear
+    hdr "Mount a Device"
+
+    # collect unmounted partitions / disks
+    local candidates
+    candidates=$(lsblk -o NAME,SIZE,TYPE,LABEL,MOUNTPOINT,FSTYPE -nr 2>/dev/null \
+        | awk '$5=="" && $3!="disk" && $3!="rom" {
+            printf "%-12s  %-6s  %-12s  %s\n", $1, $2, $4, $6
+        }')
+
+    if [[ -z "$candidates" ]]; then
+        whiptail --msgbox "No unmounted partitions found." 8 45 --title "Mount"
+        return
+    fi
+
+    local sel
+    sel=$( { printf "%-12s  %-6s  %-12s  %s\n" "DEVICE" "SIZE" "LABEL" "FSTYPE"
+              echo "$candidates"; } \
+        | fzf --prompt="Device to mount > " \
+              --header="Enter=select  Esc=cancel" \
+              --height=50% --border=rounded) || return
+
+    local dev
+    dev=$(echo "$sel" | awk '{print $1}')
+    [[ -z "$dev" || "$dev" == "DEVICE" ]] && return
+
+    # suggest a mountpoint
+    local label
+    label=$(lsblk -no LABEL "/dev/$dev" 2>/dev/null | head -1)
+    local default_mp="/mnt/${label:-$dev}"
+
+    local mp
+    mp=$(whiptail --inputbox "Mount point:" 8 50 "$default_mp" \
+        --title "Mount /dev/$dev" 3>&1 1>&2 2>&3) || return
+    [[ -z "$mp" ]] && return
+
+    # create mountpoint if missing
+    if [[ ! -d "$mp" ]]; then
+        if whiptail --yesno "Create directory '$mp'?" 8 50 --title "mkdir"; then
+            mkdir -p "$mp" || { err "Cannot create $mp"; sleep 1; return; }
+        else
+            return
+        fi
+    fi
+
+    # optional mount flags
+    local flags
+    flags=$(whiptail --inputbox "Extra mount options (leave blank for defaults):" \
+        8 60 "" --title "Mount options" 3>&1 1>&2 2>&3) || flags=""
+
+    clear
+    if [[ -n "$flags" ]]; then
+        mount -o "$flags" "/dev/$dev" "$mp"
+    else
+        mount "/dev/$dev" "$mp"
+    fi
+    if [[ $? -eq 0 ]]; then
+        ok "/dev/$dev  →  $mp"
+    else
+        err "Mount failed — check dmesg or journalctl"
+    fi
+    sleep 2
+}
+
+# ── unmount a device ────────────────────────────────────────────────────────
+drives_umount() {
+    clear
+    hdr "Unmount a Device"
+
+    local mounted
+    mounted=$(lsblk -o NAME,SIZE,MOUNTPOINT -nr 2>/dev/null \
+        | awk '$3!="" && $3!="/" && $3!~"^/boot" {
+            printf "%-12s  %-6s  %s\n", $1, $2, $3
+        }')
+
+    if [[ -z "$mounted" ]]; then
+        whiptail --msgbox "No user-mountable mounted devices found." 8 50 --title "Unmount"
+        return
+    fi
+
+    local sel
+    sel=$( { printf "%-12s  %-6s  %s\n" "DEVICE" "SIZE" "MOUNTPOINT"
+              echo "$mounted"; } \
+        | fzf --prompt="Unmount > " \
+              --header="Enter=select  Esc=cancel" \
+              --height=50% --border=rounded) || return
+
+    local dev mp
+    dev=$(echo "$sel" | awk '{print $1}')
+    mp=$(echo "$sel"  | awk '{print $3}')
+    [[ -z "$dev" || "$dev" == "DEVICE" ]] && return
+
+    umount "/dev/$dev" 2>&1
+    if [[ $? -eq 0 ]]; then
+        ok "Unmounted /dev/$dev (was at $mp)"
+    else
+        err "Failed to unmount /dev/$dev — device busy?"
+    fi
+    sleep 2
+}
+
+# ── create fstab entry ───────────────────────────────────────────────────────
+drives_fstab() {
+    clear
+    hdr "Add fstab Entry (persistent mount)"
+
+    # pick a device
+    local sel
+    sel=$(lsblk -o NAME,SIZE,TYPE,LABEL,MOUNTPOINT,FSTYPE -nr 2>/dev/null \
+        | awk '$3!="disk" && $3!="rom"' \
+        | fzf --prompt="Device > " \
+              --header="Enter=select  Esc=cancel" \
+              --height=50% --border=rounded) || return
+
+    local dev fstype label
+    dev=$(echo "$sel" | awk '{print $1}')
+    [[ -z "$dev" ]] && return
+    fstype=$(lsblk -no FSTYPE "/dev/$dev" 2>/dev/null | head -1)
+    label=$(lsblk  -no LABEL  "/dev/$dev" 2>/dev/null | head -1)
+
+    # get UUID
+    local uuid
+    uuid=$(blkid -s UUID -o value "/dev/$dev" 2>/dev/null | head -1)
+    if [[ -z "$uuid" ]]; then
+        err "No UUID found for /dev/$dev — cannot create fstab entry"
+        sleep 2; return
+    fi
+
+    # mountpoint
+    local mp
+    mp=$(whiptail --inputbox "Mount point (e.g. /mnt/data):" 8 55 \
+        "/mnt/${label:-$dev}" --title "fstab entry" 3>&1 1>&2 2>&3) || return
+    [[ -z "$mp" ]] && return
+
+    # options
+    local opts
+    opts=$(whiptail --inputbox "Mount options:" 8 55 "defaults,nofail" \
+        --title "fstab options" 3>&1 1>&2 2>&3) || opts="defaults,nofail"
+
+    local entry="UUID=${uuid}  ${mp}  ${fstype:-auto}  ${opts}  0 2"
+    echo
+    echo -e "  ${BOLD}New fstab entry:${RESET}"
+    echo -e "  ${CYAN}${entry}${RESET}"
+    echo
+
+    if whiptail --yesno "Append this entry to /etc/fstab?" 8 60 --title "Confirm"; then
+        mkdir -p "$mp" 2>/dev/null || true
+        echo "$entry" >> /etc/fstab
+        ok "Entry added to /etc/fstab"
+        if whiptail --yesno "Run 'mount -a' to test now?" 8 45 --title "Test"; then
+            mount -a && ok "mount -a succeeded" || err "mount -a failed — check /etc/fstab"
+        fi
+    else
+        warn "Cancelled — nothing written"
+    fi
+    sleep 2
+}
+
+# ── SMART health ─────────────────────────────────────────────────────────────
+drives_smart() {
+    if ! command -v smartctl &>/dev/null; then
+        whiptail --msgbox "smartmontools not installed.\nInstall with: dnf install smartmontools" \
+            10 50 --title "SMART"
+        return
+    fi
+
+    clear
+    hdr "SMART Disk Health"
+
+    local disks
+    disks=$(lsblk -o NAME,TYPE -nr 2>/dev/null | awk '$2=="disk"{print $1}')
+    if [[ -z "$disks" ]]; then
+        echo "  No physical disks found"; sleep 2; return
+    fi
+
+    local sel
+    sel=$(echo "$disks" \
+        | fzf --prompt="Disk > " \
+              --header="Enter=check  Esc=cancel" \
+              --height=40% --border=rounded) || return
+
+    [[ -z "$sel" ]] && return
+    clear
+    hdr "SMART: /dev/$sel"
+    smartctl -H -A "/dev/$sel" 2>&1 || true
+    echo
+    read -rp "Press enter to continue..."
+}
+
+# ── wipe (dd zeros) ──────────────────────────────────────────────────────────
+drives_wipe() {
+    clear
+    hdr "⚠  Zero-fill / Wipe Device"
+    warn "THIS PERMANENTLY DESTROYS ALL DATA ON THE TARGET DEVICE."
+    echo
+
+    local disks
+    disks=$(lsblk -o NAME,SIZE,TYPE,LABEL -nr 2>/dev/null \
+        | awk '$3=="disk"{printf "%-10s  %-8s  %s\n", $1, $2, $4}')
+
+    local sel
+    sel=$( { printf "%-10s  %-8s  %s\n" "DEVICE" "SIZE" "LABEL"
+              echo "$disks"; } \
+        | fzf --prompt="WIPE > " \
+              --header="DANGER — Enter=select  Esc=cancel" \
+              --color="prompt:red,border:red" \
+              --height=40% --border=rounded) || return
+
+    local dev
+    dev=$(echo "$sel" | awk '{print $1}')
+    [[ -z "$dev" || "$dev" == "DEVICE" ]] && return
+
+    # double-confirm
+    local confirm
+    confirm=$(whiptail --inputbox \
+        "Type the device name exactly to confirm wipe: /dev/__\n\nYou typed to wipe: /dev/${dev}" \
+        12 60 --title "CONFIRM WIPE" 3>&1 1>&2 2>&3) || return
+
+    if [[ "$confirm" != "$dev" ]]; then
+        warn "Name mismatch — wipe cancelled"
+        sleep 2; return
+    fi
+
+    # make sure it's unmounted
+    if grep -q "/dev/$dev" /proc/mounts 2>/dev/null; then
+        err "/dev/$dev is mounted — unmount first"
+        sleep 2; return
+    fi
+
+    clear
+    warn "Wiping /dev/$dev with zeros … (Ctrl+C to abort)"
+    dd if=/dev/zero of="/dev/$dev" bs=4M status=progress 2>&1 && \
+        ok "Wipe complete" || err "dd exited with error"
+    echo
+    read -rp "Press enter..."
+}
+
+# ── drives menu ──────────────────────────────────────────────────────────────
+info_drives() {
+    hdr "Storage"
+    lsblk -o NAME,SIZE,TYPE,LABEL,MOUNTPOINT,FSTYPE 2>/dev/null | head -20
+    echo
+}
+
+menu_drives() {
+    while true; do
+        # status line: count mounted, count devices
+        local n_dev n_mnt
+        n_dev=$(lsblk -no TYPE 2>/dev/null | grep -c disk || echo 0)
+        n_mnt=$(lsblk -no MOUNTPOINT 2>/dev/null | grep -c '/' || echo 0)
+
+        local choice
+        choice=$(whiptail --title "💾  Drives  [${n_dev} disk(s)  •  ${n_mnt} mount(s)]" \
+            --menu "Choose action" 20 58 8 \
+            "1" "📋  Overview  (lsblk + df)" \
+            "2" "📂  Mount a device" \
+            "3" "⏏️   Unmount a device" \
+            "4" "📌  Add fstab entry  (persistent)" \
+            "5" "🩺  SMART health check" \
+            "6" "💀  Wipe device  (dd zeros) ⚠" \
+            "7" "🔄  Reload partition table  (partprobe)" \
+            "b" "← Back" \
+            3>&1 1>&2 2>&3) || return
+
+        case "$choice" in
+            1) drives_info    ;;
+            2) drives_mount   ;;
+            3) drives_umount  ;;
+            4) drives_fstab   ;;
+            5) drives_smart   ;;
+            6) drives_wipe    ;;
+            7)
+                partprobe 2>/dev/null && ok "Partition table reloaded" \
+                    || warn "partprobe failed (install util-linux?)"
+                sleep 1 ;;
+            b) return ;;
+        esac
+    done
+}
+
 main_menu() {
     while true; do
         show_status
 
         local choice
         choice=$(whiptail --title "✦ ttykit ✦" \
-            --menu "What do you want to manage?" 18 55 6 \
+            --menu "What do you want to manage?" 20 55 7 \
             "1" "🔊  Audio" \
             "2" "💡  Brightness" \
             "3" "🌐  Networking" \
             "4" "🔵  Bluetooth" \
             "5" "⌨️   keyd (key remapping)" \
+            "6" "💾  Drives & Mounts" \
             "q" "Quit" \
             3>&1 1>&2 2>&3) || exit 0
 
@@ -1100,6 +1452,7 @@ main_menu() {
             3) menu_network    ;;
             4) menu_bluetooth  ;;
             5) menu_keyd       ;;
+            6) menu_drives     ;;
             q) exit 0          ;;
         esac
     done
@@ -1107,16 +1460,17 @@ main_menu() {
 
 # ─── entrypoint ───────────────────────────────────────────────────────────────
 case "${1:-}" in
-    --firstrun) first_run  ;;
-    bat)        info_bat   ;;
-    audio)      info_audio ;;
-    net)        info_net   ;;
-    bt)         info_bt    ;;
-    bri)        info_bri   ;;
-    all)        info_all   ;;
-    "")         main_menu  ;;
+    --firstrun) first_run   ;;
+    bat)        info_bat    ;;
+    audio)      info_audio  ;;
+    net)        info_net    ;;
+    bt)         info_bt     ;;
+    bri)        info_bri    ;;
+    drives)     info_drives ;;
+    all)        info_all; info_drives ;;
+    "")         main_menu   ;;
     *)
-        echo "usage: $0 [--firstrun | bat | audio | net | bt | bri | all]"
+        echo "usage: $0 [--firstrun | bat | audio | net | bt | bri | drives | all]"
         exit 1
         ;;
 esac
